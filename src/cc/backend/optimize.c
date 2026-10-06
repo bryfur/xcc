@@ -2431,65 +2431,138 @@ static int bb_index_of(BBContainer *bbcon, BB *bb);
 
 // Constants known at each block's entry: a forward dataflow over the
 // function (the intersection over its predecessors of what they know at
-// their ends, with what their jumps to it say).  Maps: <VReg*, VReg* const>.
+// their ends, with what their jumps to it say).  The maps: (register,
+// value) pairs, each value as the register's type has it.
 typedef struct {
-  Vector *in;   // NULL: not reached yet (everything)
-} KnownIn;
+  VReg **v;
+  int64_t *c;
+  int len, cap;
+  bool reached;  // (not reached yet: everything)
+} KMap;
 
-static VReg *kmap_get(Vector *m, VReg *v) {
-  for (int i = 0; i < m->len; i += 2) {
-    if (m->data[i] == v)
-      return m->data[i + 1];
+static int kmap_find(const KMap *m, const VReg *v) {
+  for (int i = 0; i < m->len; ++i) {
+    if (m->v[i] == v)
+      return i;
   }
-  return NULL;
+  return -1;
 }
 
-static void kmap_set(Vector *m, VReg *v, VReg *c) {
-  for (int i = 0; i < m->len; i += 2) {
-    if (m->data[i] == v) {
-      if (c == NULL) {
-        vec_remove_at(m, i);
-        vec_remove_at(m, i);
-      } else {
-        m->data[i + 1] = c;
+static void kmap_set(KMap *m, VReg *v, int64_t c) {
+  int i = kmap_find(m, v);
+  if (i < 0) {
+    if (m->len >= m->cap) {
+      m->cap = m->cap != 0 ? m->cap * 2 : 8;
+      m->v = realloc_or_die(m->v, sizeof(*m->v) * m->cap);
+      m->c = realloc_or_die(m->c, sizeof(*m->c) * m->cap);
+    }
+    i = m->len++;
+    m->v[i] = v;
+  }
+  m->c[i] = c;
+}
+
+static void kmap_del(KMap *m, VReg *v) {
+  int i = kmap_find(m, v);
+  if (i >= 0) {
+    --m->len;
+    m->v[i] = m->v[m->len];
+    m->c[i] = m->c[m->len];
+  }
+}
+
+static void kmap_copy(KMap *dst, const KMap *src) {
+  if (dst->cap < src->len) {
+    dst->cap = src->len + 8;
+    dst->v = realloc_or_die(dst->v, sizeof(*dst->v) * dst->cap);
+    dst->c = realloc_or_die(dst->c, sizeof(*dst->c) * dst->cap);
+  }
+  if (src->len > 0) {
+    memcpy(dst->v, src->v, sizeof(*dst->v) * src->len);
+    memcpy(dst->c, src->c, sizeof(*dst->c) * src->len);
+  }
+  dst->len = src->len;
+  dst->reached = src->reached;
+}
+
+// The registers worth tracking: those a jump tests or a table jump takes,
+// and those they are copied from (NULL: all)
+static unsigned char *kmap_wanted;
+static int kmap_wanted_len;
+
+static bool kmap_want(const VReg *v) {
+  return kmap_wanted == NULL || (v->virt < kmap_wanted_len && kmap_wanted[v->virt]);
+}
+
+static void kmap_find_wanted(RegAlloc *ra, BBContainer *bbcon) {
+  int n = ra->vregs->len;
+  unsigned char *w = calloc_or_die(n + 1);
+  for (int i = 0; i < bbcon->len; ++i) {
+    Vector *irs = ((BB*)bbcon->data[i])->irs;
+    for (int j = 0; j < irs->len; ++j) {
+      IR *ir = irs->data[j];
+      if (ir->kind == IR_JMP || ir->kind == IR_TJMP) {
+        VReg *o[] = {ir->opr1, ir->opr2};
+        for (int k = 0; k < 2; ++k) {
+          if (o[k] != NULL && !(o[k]->flag & VRF_CONST) && o[k]->virt < n)
+            w[o[k]->virt] = 1;
+        }
       }
-      return;
     }
   }
-  if (c != NULL) {
-    vec_push(m, v);
-    vec_push(m, c);
+  for (bool more = true; more; ) {
+    more = false;
+    for (int i = 0; i < bbcon->len; ++i) {
+      Vector *irs = ((BB*)bbcon->data[i])->irs;
+      for (int j = 0; j < irs->len; ++j) {
+        IR *ir = irs->data[j];
+        if ((ir->kind == IR_MOV || ir->kind == IR_CAST) && ir->dst != NULL &&
+            !(ir->dst->flag & VRF_CONST) && ir->dst->virt < n && w[ir->dst->virt] &&
+            !(ir->opr1->flag & VRF_CONST) && ir->opr1->virt < n && !w[ir->opr1->virt]) {
+          w[ir->opr1->virt] = 1;
+          more = true;
+        }
+      }
+    }
   }
-}
-
-static bool kconst_equal(VReg *a, VReg *b) {
-  return a->fixnum == b->fixnum;
+  free(kmap_wanted);
+  kmap_wanted = w;
+  kmap_wanted_len = n;
 }
 
 // The map at a block's end, from its entry's
-static void kmap_track(RegAlloc *ra, Vector *m, BB *bb) {
+static void kmap_track(KMap *m, BB *bb) {
   for (int j = 0; j < bb->irs->len; ++j) {
     IR *ir = bb->irs->data[j];
     VReg *dst = ir->dst;
     if (dst == NULL || (dst->flag & VRF_CONST))
       continue;
-    VReg *c = NULL;
+    if (!kmap_want(dst)) {
+      if (m->len > 0)
+        kmap_del(m, dst);
+      continue;
+    }
     if ((ir->kind == IR_MOV || ir->kind == IR_CAST) && plain_int_vreg(dst) &&
         dst->vsize <= VRegSize4 && ir->opr1->vsize <= VRegSize4 && !(ir->opr1->flag & VRF_FLONUM)) {
-      VReg *s = ir->opr1->flag & VRF_CONST ? ir->opr1 : kmap_get(m, ir->opr1);
-      if (s != NULL) {
-        int64_t v = wrap_value(s->fixnum, 1 << dst->vsize, (dst->flag & VRF_UNSIGNED) != 0);
-        c = v == s->fixnum && s->vsize == dst->vsize &&
-            (s->flag & VRF_UNSIGNED) == (dst->flag & VRF_UNSIGNED)
-                ? s : reg_alloc_spawn_const(ra, v, dst->vsize, dst->flag & VRF_UNSIGNED);
+      int64_t s;
+      int k;
+      if (ir->opr1->flag & VRF_CONST) {
+        s = ir->opr1->fixnum;
+      } else if ((k = kmap_find(m, ir->opr1)) >= 0) {
+        s = m->c[k];
+      } else {
+        kmap_del(m, dst);
+        continue;
       }
+      kmap_set(m, dst, wrap_value(s, 1 << dst->vsize, (dst->flag & VRF_UNSIGNED) != 0));
+      continue;
     }
-    kmap_set(m, dst, c);
+    kmap_del(m, dst);
   }
 }
 
 // What the edge from q to bb adds: a table jump's index, x == c
-static void kmap_edge(RegAlloc *ra, Vector *m, BB *q, BB *bb) {
+static void kmap_edge(KMap *m, BB *q, BB *bb) {
   Vector *qirs = q->irs;
   if (qirs->len == 0)
     return;
@@ -2520,11 +2593,10 @@ static void kmap_edge(RegAlloc *ra, Vector *m, BB *q, BB *bb) {
   } else {
     return;
   }
-  if (!plain_int_vreg(v) || v->vsize > VRegSize4)
+  if (!plain_int_vreg(v) || v->vsize > VRegSize4 || !kmap_want(v))
     return;
   int64_t cv = wrap_value(c, 1 << v->vsize, (v->flag & VRF_UNSIGNED) != 0);
-  VReg *k = reg_alloc_spawn_const(ra, cv, v->vsize, v->flag & VRF_UNSIGNED);
-  kmap_set(m, v, k);
+  kmap_set(m, v, cv);
   // (and the register it was copied from before, in q or the blocks q is
   // the only way from: a switch's value copied before its range check)
   BB *chain[3] = {q, NULL, NULL};
@@ -2547,109 +2619,97 @@ static void kmap_edge(RegAlloc *ra, Vector *m, BB *q, BB *bb) {
       bool kept = true;
       for (int d = 0; d < b && kept; ++d)
         kept = !defined_in(chain[d]->irs, 0, chain[d]->irs->len, x);
-      if (kept) {  // (the same bits: the value as x's type has it)
-        int64_t xv = wrap_value(cv, 1 << x->vsize, (x->flag & VRF_UNSIGNED) != 0);
-        kmap_set(m, x, reg_alloc_spawn_const(ra, xv, x->vsize, x->flag & VRF_UNSIGNED));
-      }
+      if (kept && kmap_want(x))  // (the same bits: the value as x's type has it)
+        kmap_set(m, x, wrap_value(cv, 1 << x->vsize, (x->flag & VRF_UNSIGNED) != 0));
     }
     break;
   }
 }
 
-static Vector **known_in_maps(RegAlloc *ra, BBContainer *bbcon) {
+static KMap *known_in_maps(BBContainer *bbcon) {
   int n = bbcon->len;
+  KMap *in = calloc_or_die(sizeof(*in) * (n + 1));
+  KMap *out = calloc_or_die(sizeof(*out) * (n + 1));
   for (int i = 0; i < n; ++i)
     ((BB*)bbcon->data[i])->index = i;
-  Vector **in = calloc_or_die(sizeof(*in) * (n + 1));
-  Vector **out = calloc_or_die(sizeof(*out) * (n + 1));
-  in[0] = new_vector();
-  Vector tmp;
-  vec_init(&tmp);
-  for (int pass = 0; pass < 6; ++pass) {
+  in[0].reached = true;
+  KMap tmp = {0}, meet = {0};
+  for (int pass = 0; pass < 3; ++pass) {
     bool changed = false;
     for (int i = 0; i < n; ++i) {
       BB *bb = bbcon->data[i];
       if (i > 0) {
         // The meet over the predecessors reached
-        Vector *meet = NULL;
+        meet.reached = false;
+        meet.len = 0;
         for (int f = 0; f < bb->from_bbs->len; ++f) {
           BB *q = bb->from_bbs->data[f];
           int qi = q->index;
-          if (qi < 0 || qi >= n || bbcon->data[qi] != q || out[qi] == NULL)
+          if (qi < 0 || qi >= n || bbcon->data[qi] != q || !out[qi].reached)
             continue;
-          vec_clear(&tmp);
-          vec_concat(&tmp, out[qi]);
-          kmap_edge(ra, &tmp, q, bb);
-          if (meet == NULL) {
-            meet = new_vector();
-            vec_concat(meet, &tmp);
+          kmap_copy(&tmp, &out[qi]);
+          kmap_edge(&tmp, q, bb);
+          if (!meet.reached) {
+            kmap_copy(&meet, &tmp);
           } else {
-            for (int k = 0; k < meet->len; k += 2) {
-              VReg *o = kmap_get(&tmp, meet->data[k]);
-              if (o == NULL || !kconst_equal(o, meet->data[k + 1])) {
-                vec_remove_at(meet, k);
-                vec_remove_at(meet, k);
-                k -= 2;
+            for (int k = 0; k < meet.len; ++k) {
+              int o = kmap_find(&tmp, meet.v[k]);
+              if (o < 0 || tmp.c[o] != meet.c[k]) {
+                kmap_del(&meet, meet.v[k]);
+                --k;
               }
             }
           }
         }
-        if (meet == NULL)
+        if (!meet.reached)
           continue;
-        if (in[i] != NULL && in[i]->len == meet->len) {
-          bool same = true;
-          for (int k = 0; k < meet->len && same; k += 2) {
-            VReg *o = kmap_get(in[i], meet->data[k]);
-            same = o != NULL && kconst_equal(o, meet->data[k + 1]);
-          }
-          if (same) {
-            free_vector(meet);
-            goto track;
-          }
+        bool same = in[i].reached && in[i].len == meet.len;
+        for (int k = 0; k < meet.len && same; ++k) {
+          int o = kmap_find(&in[i], meet.v[k]);
+          same = o >= 0 && in[i].c[o] == meet.c[k];
         }
-        if (in[i] != NULL)
-          free_vector(in[i]);
-        in[i] = meet;
-        changed = true;
+        if (!same) {
+          kmap_copy(&in[i], &meet);
+          changed = true;
+        }
       }
-    track:
-      if (in[i] == NULL)
+      if (!in[i].reached)
         continue;
-      if (out[i] == NULL)
-        out[i] = new_vector();
-      vec_clear(out[i]);
-      vec_concat(out[i], in[i]);
-      kmap_track(ra, out[i], bb);
+      kmap_copy(&out[i], &in[i]);
+      kmap_track(&out[i], bb);
     }
     if (!changed && pass > 0)
       break;
   }
-  vec_release(&tmp);
   for (int i = 0; i < n; ++i) {
-    if (out[i] != NULL)
-      free_vector(out[i]);
+    free(out[i].v);
+    free(out[i].c);
   }
   free(out);
+  free(tmp.v);
+  free(tmp.c);
+  free(meet.v);
+  free(meet.c);
   return in;
 }
 
-static void free_known_in_maps(Vector **in, int n) {
+static void free_known_in_maps(KMap *in, int n) {
   for (int i = 0; i < n; ++i) {
-    if (in[i] != NULL)
-      free_vector(in[i]);
+    free(in[i].v);
+    free(in[i].c);
   }
   free(in);
 }
 
 // The constants known at the end of p: along its chain of only
 // predecessors (a few), what the jumps between them say and what they do
-static bool thread_known_at_end(Thread *th, BB *p, Vector *in) {
-  if (in == NULL)
+static bool thread_known_at_end(Thread *th, BB *p, KMap *in) {
+  if (in == NULL || !in->reached)
     return false;
-  for (int k = 0; k < in->len; k += 2) {
-    VReg *v = in->data[k];
+  for (int k = 0; k < in->len; ++k) {
+    VReg *v = in->v[k];
     if (v->virt < th->known_len)
-      thread_set(th, v, in->data[k + 1]);
+      thread_set(th, v, reg_alloc_spawn_const(th->ra, in->c[k], v->vsize, v->flag & VRF_UNSIGNED));
   }
   for (int j = 0; j < p->irs->len; ++j)
     thread_track(th, p->irs->data[j]);
@@ -2682,6 +2742,11 @@ static int bb_index_of(BBContainer *bbcon, BB *bb) {
   return -1;
 }
 
+static double pass_time[16];
+static const char *pass_name[16];
+static int pass_on;
+static double pass_now(void);
+
 static bool thread_jumps(RegAlloc *ra, BBContainer *bbcon) {
   Thread th = {.ra = ra};
   vec_init(&th.undo);
@@ -2696,8 +2761,11 @@ static bool thread_jumps(RegAlloc *ra, BBContainer *bbcon) {
   BB **orig = malloc_or_die(sizeof(*orig) * (count + 1));
   for (int i = 0; i < count; ++i)
     orig[i] = bbcon->data[i];
+  kmap_find_wanted(ra, bbcon);
+  VReg **known_buf = NULL;
+  int known_cap = 0;
   int kin_len = bbcon->len;
-  Vector **kin = known_in_maps(ra, bbcon);
+  KMap *kin = known_in_maps(bbcon);
   for (int i = 0; i < count && total < THREAD_FUNC_IRS; ++i) {
     BB *p = orig[i];
     for (int edge = 0; edge < 2 && total < THREAD_FUNC_IRS; ++edge) {
@@ -2725,28 +2793,35 @@ static bool thread_jumps(RegAlloc *ra, BBContainer *bbcon) {
       }
       if (succ == NULL || succ == p)
         continue;
-      th.known = calloc_or_die(sizeof(*th.known) * (ra->vregs->len + 1));
+      if (ra->vregs->len > known_cap) {  // (one array, cleared by undoing)
+        int ncap = ra->vregs->len + 64;
+        known_buf = realloc_or_die(known_buf, sizeof(*known_buf) * ncap);
+        memset(known_buf + known_cap, 0, sizeof(*known_buf) * (ncap - known_cap));
+        known_cap = ncap;
+      }
+      th.known = known_buf;
       th.known_len = ra->vregs->len;
-      int pi = bb_index_of(bbcon, p);
-      bool any = pi >= 0 && thread_known_at_end(&th, p, kin[pi]);
+      int pi = i;  // (its index when the facts were found: orig[] is that order)
+      bool any = pi < kin_len && thread_known_at_end(&th, p, &kin[pi]);
       if (mode != 0) {
         thread_edge_known(&th, p, last, succ);
         for (int k = 0; k < th.known_len && !any; ++k)
           any = th.known[k] != NULL;
       }
-      vec_clear(&th.undo);
       if (!any) {
-        free(th.known);
+        thread_undo(&th, 0);
         continue;
       }
       th.best = 0;
       th.best_dest = NULL;
       th.budget = THREAD_MAX_IRS;
       th.walking = true;
+      double tw_ = pass_on ? pass_now() : 0;
       thread_walk(&th, succ, 0);
+      if (pass_on) { pass_time[12] += pass_now() - tw_; pass_name[12] = "walk"; }
       th.walking = false;
       if (th.best == 0 || th.best_dest == NULL) {
-        free(th.known);
+        thread_undo(&th, 0);
         continue;
       }
       // Where the copies go
@@ -2776,7 +2851,7 @@ static bool thread_jumps(RegAlloc *ra, BBContainer *bbcon) {
               break;
           }
           if (k >= bbcon->len) {
-            free(th.known);
+            thread_undo(&th, 0);
             continue;
           }
           at = k;
@@ -2822,16 +2897,19 @@ static bool thread_jumps(RegAlloc *ra, BBContainer *bbcon) {
       }
       vec_push(cur->irs, new_ir_jmp(th.best_dest));
       cur->next = after;
-      free(th.known);
+      thread_undo(&th, 0);
       changed = true;
-      // The facts again, with the new blocks
-      detect_from_bbs(bbcon);
-      free_known_in_maps(kin, kin_len);
-      kin_len = bbcon->len;
-      kin = known_in_maps(ra, bbcon);
+      // The facts of the blocks there were stay true: a copy repeats a path
+      // that was there, so what held at its end on every path (into its
+      // last block, then its target) holds at the copy's; a block that
+      // lost a predecessor knows more, not less.  Not computed again (nor
+      // the predecessors: the caller finds them).
     }
   }
   free_known_in_maps(kin, kin_len);
+  free(known_buf);
+  free(kmap_wanted);
+  kmap_wanted = NULL;
   free(orig);
   free(uses);
   vec_release(&th.undo);
@@ -2958,7 +3036,36 @@ static void cond_flow(RegAlloc *ra, BBContainer *bbcon) {
   }
 }
 
+// FPC: XCC_PASS_TIME set: each pass's time, at the end
+#include <time.h>
+
+static void print_pass_times(void) {
+  for (int i = 0; i < 16; ++i) {
+    if (pass_name[i] != NULL)
+      fprintf(stderr, "pass %-12s %8.3f ms\n", pass_name[i], pass_time[i] * 1000);
+  }
+}
+
+static double pass_now(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
+#define TIMED(i, name, stmt)  do { \
+    double t0_ = pass_on ? pass_now() : 0; \
+    stmt; \
+    if (pass_on) { pass_time[i] += pass_now() - t0_; pass_name[i] = name; } \
+  } while (0)
+
 void optimize(RegAlloc *ra, BBContainer *bbcon) {
+  static bool pass_init;
+  if (!pass_init) {
+    pass_init = true;
+    pass_on = getenv("XCC_PASS_TIME") != NULL;
+    if (pass_on)
+      atexit(print_pass_times);
+  }
   clear_unused_bbs(bbcon);
 
   // Peephole
@@ -2981,27 +3088,28 @@ void optimize(RegAlloc *ra, BBContainer *bbcon) {
       coalesce_moves(ra, bbcon);  // FPC
     }
   } else {
-    coalesce_moves(ra, bbcon);  // FPC
-    drop_masked_casts(ra, bbcon);  // FPC
-    cond_flow(ra, bbcon);  // FPC
-    if (thread_jumps(ra, bbcon)) {  // FPC
+    TIMED(0, "coalesce", coalesce_moves(ra, bbcon));  // FPC
+    TIMED(1, "masked", drop_masked_casts(ra, bbcon));  // FPC
+    TIMED(2, "cond_flow", cond_flow(ra, bbcon));  // FPC
+    bool threaded;
+    TIMED(3, "thread", threaded = thread_jumps(ra, bbcon));  // FPC
+    if (threaded) {
       detect_from_bbs(bbcon);
       clear_unused_bbs(bbcon);
       remove_unnecessary_bb(bbcon);
       detect_from_bbs(bbcon);
-      cond_flow(ra, bbcon);
+      TIMED(4, "cond_flow2", cond_flow(ra, bbcon));
     }
     if (fold_known_jumps(ra, bbcon)) {  // FPC
       detect_from_bbs(bbcon);
       clear_unused_bbs(bbcon);
     }
-    local_cse(ra, bbcon);  // FPC
-    coalesce_moves(ra, bbcon);  // FPC: what the passes above left
-    remove_unused_vregs(ra, bbcon);
-    remove_unnecessary_bb(bbcon);
-    detect_from_bbs(bbcon);
-    hoist_loop_invariants(ra, bbcon);  // FPC
-    coalesce_moves(ra, bbcon);  // FPC: the loads made MOVs
+    TIMED(5, "cse", local_cse(ra, bbcon));  // FPC
+    TIMED(6, "coalesce2", coalesce_moves(ra, bbcon));  // FPC: what the passes above left
+    TIMED(7, "unused", remove_unused_vregs(ra, bbcon));
+    TIMED(8, "bbs", remove_unnecessary_bb(bbcon); detect_from_bbs(bbcon));
+    TIMED(9, "licm", hoist_loop_invariants(ra, bbcon));  // FPC
+    TIMED(10, "coalesce3", coalesce_moves(ra, bbcon));  // FPC: the loads made MOVs
   }
   detect_from_bbs(bbcon);
 }
