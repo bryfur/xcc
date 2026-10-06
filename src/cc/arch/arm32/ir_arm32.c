@@ -391,6 +391,35 @@ static const char *indexed(VReg *base, VReg *index, int shift) {
 // takes (-255..255): the step (that IR then emitted with the access), or 0
 static IR *s_skip_ir;
 
+// FPC: an address stepped by -255..255 right before a load or store of it
+// (offset 0): the access pre-indexed with writeback (ldrb r, [p, #1]!), the
+// step not emitted.  Whether the access can (as ei_load/ei_store do it).
+static IR *s_pre_ir;
+static int s_pre_step;
+
+static bool pre_index_ok(IR *add, IR *nx) {
+  VReg *p = add->dst;
+  if (nx == NULL || add->opr1 != p || add->opr2 == NULL || !(add->opr2->flag & VRF_CONST) ||
+      (add->opr2->flag & VRF_FLONUM) || add->additional_operands != NULL ||
+      add->bfx.sh_kind != 0 || (p->flag & (VRF_SPILLED | VRF_FLONUM)) || p->vsize != VRegSize4)
+    return false;
+  int64_t c = add->kind == IR_ADD ? add->opr2->fixnum : -add->opr2->fixnum;
+  if (c == 0 || c < -255 || c > 255)
+    return false;
+  if (nx->kind == IR_LOAD) {
+    VReg *d = nx->dst;
+    return nx->opr1 == p && nx->opr2 == NULL && nx->load.offset == 0 && !nx->load.unaligned &&
+           !(d->flag & VRF_FLONUM) && d->vsize <= VRegSize4 && d->phys != p->phys;
+  }
+  if (nx->kind == IR_STORE) {
+    VReg *s = nx->opr1;
+    return nx->opr2 == p && nx->additional_operands == NULL && nx->store.offset == 0 &&
+           !nx->store.unaligned && !(s->flag & (VRF_FLONUM | VRF_CONST)) && s->vsize <= VRegSize4 &&
+           s->phys != p->phys;
+  }
+  return false;
+}
+
 static int post_step(VReg *addr) {
   IR *nx = emit_next_ir;
   if (nx == NULL || (nx->kind != IR_ADD && nx->kind != IR_SUB) || nx->dst != addr ||
@@ -438,6 +467,11 @@ static void ei_load(IR *ir) {
   default:         op = "ldr"; break;
   }
   int step;
+  if (ir == s_pre_ir) {  // FPC: pre-indexed, the step before it not emitted
+    s_pre_ir = NULL;
+    EMIT_ASM(op, R(dst), fmt("[%s, #%d]!", R(ir->opr1), s_pre_step));
+    return;
+  }
   if (!spilled && ir->load.offset == 0 && !ir->load.unaligned &&
       (step = post_step(ir->opr1)) != 0 && dst->phys != ir->opr1->phys) {
     EMIT_ASM(op, R(dst), fmt("[%s], #%d", R(ir->opr1), step));  // FPC: post-indexed
@@ -488,6 +522,11 @@ static void ei_store(IR *ir) {
     return;
   }
   int step;
+  if (ir == s_pre_ir) {  // FPC: pre-indexed, the step before it not emitted
+    s_pre_ir = NULL;
+    EMIT_ASM(op, R(src), fmt("[%s, #%d]!", R(ir->opr2), s_pre_step));
+    return;
+  }
   if (!spilled && ir->store.offset == 0 && !ir->store.unaligned && !(src->flag & VRF_CONST) &&
       (step = post_step(ir->opr2)) != 0 && src->phys != ir->opr2->phys) {
     EMIT_ASM(op, R(src), fmt("[%s], #%d", R(ir->opr2), step));  // FPC: post-indexed
@@ -566,6 +605,11 @@ static void ei_add(IR *ir) {
     s_skip_ir = NULL;
     return;
   }
+  if (pre_index_ok(ir, emit_next_ir)) {  // FPC: done by the access after (pre-indexed)
+    s_pre_ir = emit_next_ir;
+    s_pre_step = (int)ir->opr2->fixnum;
+    return;
+  }
   VReg *dst = ir->dst;
   if (ir->additional_operands != NULL && ir->opr2 == NULL) {  // FPC: fuse_arm_ops
     EMIT_ASM("mla", R(dst), R((VReg*)ir->additional_operands->data[0]),
@@ -597,6 +641,11 @@ static void ei_add(IR *ir) {
 static void ei_sub(IR *ir) {
   if (ir == s_skip_ir) {  // FPC: done by the access before (post-indexed)
     s_skip_ir = NULL;
+    return;
+  }
+  if (pre_index_ok(ir, emit_next_ir)) {  // FPC: done by the access after (pre-indexed)
+    s_pre_ir = emit_next_ir;
+    s_pre_step = -(int)ir->opr2->fixnum;
     return;
   }
   VReg *dst = ir->dst;
