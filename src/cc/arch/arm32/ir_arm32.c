@@ -530,11 +530,15 @@ static void ei_binop64(IR *ir, const char *op_lo, const char *op_hi) {
     EMIT_ASM("mov", dlo, IP);
 }
 
+static const char *shifted_opr2(IR *ir);  // FPC
+
 static void ei_add(IR *ir) {
   VReg *dst = ir->dst;
   if (ir->additional_operands != NULL && ir->opr2 == NULL) {  // FPC: fuse_arm_ops
     EMIT_ASM("mla", R(dst), R((VReg*)ir->additional_operands->data[0]),
              R((VReg*)ir->additional_operands->data[1]), R(ir->opr1));
+  } else if (ir->bfx.sh_kind != 0) {
+    EMIT_ASM("add", R(dst), R(ir->opr1), shifted_opr2(ir));
   } else if (dst->flag & VRF_FLONUM) {
     ei_fbinop(ir, "vadd.f32", "__aeabi_dadd");
   } else if (dst->vsize == VRegSize8) {
@@ -562,6 +566,8 @@ static void ei_sub(IR *ir) {
   if (ir->additional_operands != NULL && ir->opr2 == NULL) {  // FPC: fuse_arm_ops
     EMIT_ASM("mls", R(dst), R((VReg*)ir->additional_operands->data[0]),
              R((VReg*)ir->additional_operands->data[1]), R(ir->opr1));
+  } else if (ir->bfx.sh_kind != 0) {
+    EMIT_ASM("sub", R(dst), R(ir->opr1), shifted_opr2(ir));
   } else if (dst->flag & VRF_FLONUM) {
     ei_fbinop(ir, "vsub.f32", "__aeabi_dsub");
   } else if (dst->vsize == VRegSize8) {
@@ -641,8 +647,18 @@ static void ei_mod(IR *ir) {
   EMIT_ASM("mls", R(dst), IP, div, num);
 }
 
+// FPC: opr2 shifted (fuse_arm_ops): "rm, lsl #n"
+static const char *shifted_opr2(IR *ir) {
+  static const char *kKind[] = {['l'] = "lsl", ['r'] = "lsr", ['a'] = "asr"};
+  return fmt("%s, %s #%d", R(ir->opr2), kKind[(int)ir->bfx.sh_kind], ir->bfx.sh_amount);
+}
+
 static void ei_logic(IR *ir, const char *op, const char *inv_op) {
   VReg *dst = ir->dst, *o1 = ir->opr1, *o2 = ir->opr2;
+  if (ir->bfx.sh_kind != 0) {
+    EMIT_ASM(op, R(dst), R(o1), shifted_opr2(ir));
+    return;
+  }
   if (dst->vsize == VRegSize8) {
     ei_binop64(ir, op, op);
     return;
@@ -776,6 +792,10 @@ static void ei_rshift(IR *ir) {
 static void ei_neg(IR *ir) {
   VReg *dst = ir->dst, *o1 = ir->opr1;
   assert(!(o1->flag & VRF_CONST));
+  if (ir->bfx.sbfx) {  // FPC: fuse_arm_ops: -(x & 1)
+    EMIT_ASM("sbfx", R(dst), R(o1), im(0), im(1));
+    return;
+  }
   if (dst->flag & VRF_FLONUM) {
     if (dst->vsize == SZ_FLOAT) {
       EMIT_ASM("vneg.f32", S(dst), S(o1));
@@ -848,6 +868,12 @@ static void ei_cast(IR *ir) {
   VReg *dst = ir->dst, *src = ir->opr1;
   assert(!(src->flag & VRF_CONST));
   bool df = (dst->flag & VRF_FLONUM) != 0, sf = (src->flag & VRF_FLONUM) != 0;
+  if (ir->cast.trunc != 0) {  // fuse_arm_ops: (float)(int)f, the int in s15
+    bool u = ir->cast.trunc == 'u';
+    EMIT_ASM(u ? "vcvt.u32.f32" : "vcvt.s32.f32", "s15", S(src));
+    EMIT_ASM(u ? "vcvt.f32.u32" : "vcvt.f32.s32", S(dst), "s15");
+    return;
+  }
   if (!df && !sf && ir->cast.fits && src->vsize <= VRegSize4) {  // mark_fitting_casts
     if (dst->phys != src->phys)
       EMIT_ASM("mov", R(dst), R(src));
@@ -1470,6 +1496,14 @@ static int vreg_known_bits(Vector *irs, int pos, VReg *v, int depth) {
   IR *ir = irs->data[k];
   int a, b, r;
   switch (ir->kind) {
+  case IR_ADD: case IR_SUB: case IR_BITAND: case IR_BITOR: case IR_BITXOR:
+    if (ir->bfx.sh_kind != 0)  // (a shifted operand: fuse_arm_ops)
+      return by_type;
+    break;
+  default:
+    break;
+  }
+  switch (ir->kind) {
   case IR_MOV:
     r = vreg_known_bits(irs, k, ir->opr1, depth - 1);
     break;
@@ -1588,8 +1622,66 @@ static void fuse_arm_ops(RegAlloc *ra, BBContainer *bbcon) {
         --j;
         continue;
       }
+      if (ir->kind == IR_CAST && (ir->dst->flag & VRF_FLONUM) && ir->dst->vsize == VRegSize4 &&
+          plain_reg(ir->opr1) && uses[ir->opr1->virt] == 1 && defs[ir->opr1->virt] == 1 &&
+          !(ir->opr1->flag & VRF_PARAM)) {
+        // (float)(int)f: the int not out of the FPU
+        VReg *t = ir->opr1, *f;
+        IR *cv = def_in_bb(irs, j, t, &k);
+        if (cv != NULL && cv->kind == IR_CAST && ((f = cv->opr1)->flag & VRF_FLONUM) &&
+            f->vsize == VRegSize4 && !(f->flag & (VRF_CONST | VRF_FORCEMEMORY)) &&
+            !defined_between(irs, k, j, f)) {
+          ir->opr1 = f;
+          ir->cast.trunc = (t->flag & VRF_UNSIGNED) ? 'u' : 's';
+          vec_remove_at(irs, k);
+          --j;
+          continue;
+        }
+      }
+      if (ir->kind == IR_NEG && plain_reg(ir->dst) && reg32(ir->opr1) &&
+          uses[ir->opr1->virt] == 1 && defs[ir->opr1->virt] == 1 && !(ir->opr1->flag & VRF_PARAM)) {
+        // -(x & 1): sbfx
+        IR *a = def_in_bb(irs, j, ir->opr1, &k);
+        VReg *x;
+        if (a != NULL && a->kind == IR_BITAND && a->bfx.shift == 0 && a->bfx.sh_kind == 0 &&
+            (a->opr2->flag & VRF_CONST) && !(a->opr2->flag & VRF_FLONUM) && a->opr2->fixnum == 1 &&
+            reg32(x = a->opr1) && !defined_between(irs, k, j, x)) {
+          ir->opr1 = x;
+          ir->bfx.sbfx = true;
+          vec_remove_at(irs, k);
+          --j;
+          continue;
+        }
+      }
+      // A shifted operand: t = x << / >> n; d = y OP t -> OP d, y, x, lsl / lsr / asr #n
+      if ((ir->kind == IR_ADD || ir->kind == IR_SUB || ir->kind == IR_BITAND ||
+           ir->kind == IR_BITOR || ir->kind == IR_BITXOR) && ir->additional_operands == NULL &&
+          ir->bfx.shift == 0 && ir->bfx.sh_kind == 0 && reg32(ir->dst) && ir->opr2 != NULL &&
+          !((ir->dst->flag | ir->opr1->flag | ir->opr2->flag) & VRF_FLONUM) &&
+          (ir->dst->vsize == VRegSize4 || ir->kind != IR_ADD)) {
+        bool done = false;
+        for (int side = ir->kind == IR_SUB ? 1 : 0; side < 2 && !done; ++side) {
+          VReg *t = side == 0 ? ir->opr1 : ir->opr2, *y = side == 0 ? ir->opr2 : ir->opr1;
+          IR *sh;
+          if (!reg32(t) || !reg32(y) || uses[t->virt] != 1 || defs[t->virt] != 1 ||
+              (t->flag & VRF_PARAM) || (sh = def_in_bb(irs, j, t, &k)) == NULL ||
+              (sh->kind != IR_LSHIFT && sh->kind != IR_RSHIFT) || !reg32(sh->opr1) ||
+              !(sh->opr2->flag & VRF_CONST) || sh->opr2->fixnum < 1 || sh->opr2->fixnum > 31 ||
+              sh->dst->vsize != VRegSize4 || defined_between(irs, k, j, sh->opr1))
+            continue;
+          ir->opr1 = y;
+          ir->opr2 = sh->opr1;
+          ir->bfx.sh_kind = sh->kind == IR_LSHIFT ? 'l' : (sh->dst->flag & VRF_UNSIGNED) ? 'r' : 'a';
+          ir->bfx.sh_amount = (int)sh->opr2->fixnum;
+          vec_remove_at(irs, k);
+          --j;
+          done = true;
+        }
+        if (done)
+          continue;
+      }
       if ((ir->kind == IR_ADD || ir->kind == IR_SUB) && ir->additional_operands == NULL &&
-          plain_reg(ir->dst) && ir->opr2 != NULL) {
+          ir->bfx.sh_kind == 0 && plain_reg(ir->dst) && ir->opr2 != NULL) {
         for (int side = ir->kind == IR_ADD ? 0 : 1; side < 2; ++side) {
           VReg *t = side == 0 ? ir->opr1 : ir->opr2, *x = side == 0 ? ir->opr2 : ir->opr1;
           IR *mul;

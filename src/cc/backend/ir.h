@@ -179,9 +179,13 @@ typedef struct IR {
     } cond;
     struct {
       bool fits;  // FPC: the value fits the narrower type already (ARM32: no extension)
+      char trunc;  // FPC: float -> float through a 32-bit int: 's' signed, 'u' unsigned (ARM32)
     } cast;
     struct {
-      int shift;  // FPC: IR_BITAND: dst = (opr1 >> shift) & opr2 (ARM32: ubfx)
+      int shift;      // FPC: IR_BITAND: dst = (opr1 >> shift) & opr2 (ARM32: ubfx)
+      char sh_kind;   // FPC: ALU ops: opr2 shifted first: 'l' lsl, 'r' lsr, 'a' asr (ARM32)
+      int sh_amount;
+      bool sbfx;      // FPC: IR_NEG of (x & 1): sbfx dst, opr1, #0, #1 (ARM32)
     } bfx;
     struct {
       BB *bb;

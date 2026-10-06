@@ -1199,6 +1199,61 @@ static bool hoistable_kind(IR *ir) {
   }
 }
 
+// FPC: a constant that costs an instruction or more each time it is used
+// (a float's is loaded from memory; on ARM32 an integer that is not an
+// immediate of its instruction is made in a register first)
+#if XCC_TARGET_ARCH == XCC_ARCH_ARM32
+static bool thumb_modimm(uint32_t v) {
+  if (v < 256)
+    return true;
+  uint32_t b = v & 0xff;
+  if (v == (b | (b << 16)) || v == ((b << 8) | (b << 24)) || v == (b * 0x01010101u))
+    return true;
+  for (int rot = 8; rot < 32; ++rot) {
+    uint32_t x = (v << rot) | (v >> (32 - rot));  // rotate left: undo a rotate right
+    if (x >= 0x80 && x <= 0xff)
+      return true;
+  }
+  return false;
+}
+#endif
+
+static bool costly_const(IR *ir, VReg *c, int which) {
+  if (!(c->flag & VRF_CONST))
+    return false;
+  if (c->flag & VRF_FLONUM) {
+    // (a float: s registers enough; a double would take a pair of core ones)
+    return c->vsize == VRegSize4 && ir->kind != IR_PUSHARG && ir->kind != IR_RESULT &&
+           ir->kind != IR_CAST;
+  }
+#if XCC_TARGET_ARCH == XCC_ARCH_ARM32
+  // (the first operand: an operation that takes it second too)
+  if (c->vsize > VRegSize4 || (ir->dst == NULL && ir->kind != IR_JMP) ||
+      (which == 1 && ir->kind != IR_ADD && ir->kind != IR_MUL && ir->kind != IR_BITAND &&
+       ir->kind != IR_BITOR && ir->kind != IR_BITXOR && ir->kind != IR_COND && ir->kind != IR_JMP))
+    return false;
+  uint32_t v = (uint32_t)c->fixnum;
+  switch (ir->kind) {
+  case IR_MUL: case IR_DIV: case IR_MOD:
+    return true;  // (moved to a register at each use: tweak_irs)
+  case IR_ADD: case IR_SUB:
+    return !(v < 4096 || -v < 4096 || thumb_modimm(v) || thumb_modimm(-v));
+  case IR_BITAND: case IR_BITOR:
+    return !(thumb_modimm(v) || thumb_modimm(~v));
+  case IR_BITXOR:
+    return !thumb_modimm(v);
+  case IR_COND: case IR_JMP:
+    return !(thumb_modimm(v) || thumb_modimm(-v));
+  default:
+    return false;
+  }
+#else
+  (void)ir;
+  (void)which;
+  return false;
+#endif
+}
+
 static void hoist_loop_invariants(RegAlloc *ra, BBContainer *bbcon) {
   int vreg_count = ra->vregs->len;
   int *uses = malloc_or_die(sizeof(*uses) * vreg_count * 2);
@@ -1238,8 +1293,6 @@ static void hoist_loop_invariants(RegAlloc *ra, BBContainer *bbcon) {
         }
       }
     }
-    if (!inner)
-      continue;
     // Entered only at the head, and only from `pre` and the loop itself
     bool ok = true;
     for (int k = h; k <= j && ok; ++k) {
@@ -1295,14 +1348,15 @@ static void hoist_loop_invariants(RegAlloc *ra, BBContainer *bbcon) {
         // Worth a register through the loop: an address of a global (two
         // instructions), a multiplication, or what is made from a value
         // moved out already; not a base + constant (an address the
-        // load's offset takes), a few at most
-        bool worth = ir->kind == IR_IOFS || ir->kind == IR_MUL;
+        // load's offset takes), a few at most.  Out of a loop with loops
+        // in it: an address of a global only.
+        bool worth = ir->kind == IR_IOFS || (inner && ir->kind == IR_MUL);
         for (int o = 0; o < 2 && !worth; ++o) {
           VReg *opr = oprs[o];
           if (opr != NULL && !(opr->flag & VRF_CONST) && hoisted[opr->virt])
             worth = true;
         }
-        if (!worth || nhoisted >= 6)
+        if (!worth || nhoisted >= (inner ? 6 : 2))
           continue;
         vec_remove_at(irs, m);
         --m;
@@ -1310,6 +1364,44 @@ static void hoist_loop_invariants(RegAlloc *ra, BBContainer *bbcon) {
         inloop[dst->virt] = false;
         hoisted[dst->virt] = true;
         ++nhoisted;
+      }
+    }
+
+    // Constants that cost at each use (a float's load...): in registers
+    // given them before the loop (innermost loops, a few)
+    if (!inner)
+      continue;
+    VReg *consts[6], *regs[6];
+    int nconst = 0;
+    for (int k = h; k <= j; ++k) {
+      Vector *irs = ((BB*)bbcon->data[k])->irs;
+      for (int m = 0; m < irs->len; ++m) {
+        IR *ir = irs->data[m];
+        if (ir->kind == IR_MOV && !(ir->dst->flag & VRF_FLONUM))
+          continue;
+        VReg **oprs[] = {&ir->opr1, &ir->opr2};
+        for (int o = 0; o < 2; ++o) {
+          VReg *cv = *oprs[o];
+          if (cv == NULL || !costly_const(ir, cv, o + 1))
+            continue;
+          int n;
+          for (n = 0; n < nconst; ++n) {
+            VReg *x = consts[n];
+            if (x->vsize == cv->vsize && (x->flag & VRF_MASK) == (cv->flag & VRF_MASK) &&
+                ((x->flag & VRF_FLONUM) ? x->flonum.value == cv->flonum.value
+                                        : x->fixnum == cv->fixnum))
+              break;
+          }
+          if (n == nconst) {
+            if (nconst >= 6)
+              continue;
+            VReg *r = reg_alloc_spawn(ra, cv->vsize, cv->flag & VRF_MASK);
+            vec_insert(pre->irs, at++, new_ir_mov(r, cv));
+            consts[nconst] = cv;
+            regs[nconst++] = r;
+          }
+          *oprs[o] = regs[n];
+        }
       }
     }
   }
