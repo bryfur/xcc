@@ -402,7 +402,7 @@ case EX_MOD:     value = lval % rval; break; \
 case EX_BITAND:  value = lval & rval; break; \
 case EX_BITOR:   value = lval | rval; break; \
 case EX_BITXOR:  value = lval ^ rval; break; \
-case EX_LSHIFT:  value = lval << rval; break; \
+case EX_LSHIFT:  value = (UFixnum)lval << rval; break;  /* FPC: no UB */ \
 case EX_RSHIFT:  value = lval >> rval; break; \
 }
 
@@ -883,7 +883,9 @@ static Expr *make_expr_cmp_const_folding(
   case EX_FIXNUM:
     switch (rhs->kind) {
     case EX_FIXNUM:
-      if (lhs->type->fixnum.is_unsigned || rhs->type->fixnum.is_unsigned) {
+      // FPC: a pointer constant (its type no fixnum) compares unsigned
+      if (!is_fixnum(lhs->type) || !is_fixnum(rhs->type) || lhs->type->fixnum.is_unsigned ||
+          rhs->type->fixnum.is_unsigned) {
         UFixnum l = lhs->fixnum, r = rhs->fixnum;
         JUDGE(kind, tf, l, r);
       } else {

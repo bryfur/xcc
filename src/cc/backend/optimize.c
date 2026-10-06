@@ -755,6 +755,25 @@ static void count_vreg_uses(BBContainer *bbcon, int *uses, int *defs) {
   }
 }
 
+// The same with uses and defs in arrays of their own
+static void count_vreg_uses_split(BBContainer *bbcon, int *uses, int *defs) {
+  for (int i = 0; i < bbcon->len; ++i) {
+    BB *bb = bbcon->data[i];
+    for (int j = 0; j < bb->irs->len; ++j) {
+      IR *ir = bb->irs->data[j];
+      VReg *operands[] = {ir->opr1, ir->opr2};
+      int n = 2 + (ir->additional_operands != NULL ? ir->additional_operands->len : 0);
+      for (int k = 0; k < n; ++k) {
+        VReg *vreg = k < 2 ? operands[k] : ir->additional_operands->data[k - 2];
+        if (vreg != NULL && !(vreg->flag & VRF_CONST))
+          ++uses[vreg->virt];
+      }
+      if (ir->dst != NULL && !(ir->dst->flag & VRF_CONST))
+        ++defs[ir->dst->virt];
+    }
+  }
+}
+
 static bool coalescable(VReg *t, VReg *v) {
   // t: a temporary; v: any register variable (a parameter too)
   const int NG = VRF_CONST | VRF_STACK_PARAM | VRF_FORCEMEMORY | VRF_VOLATILEREG | VRF_NO_SPILL;
@@ -1279,11 +1298,9 @@ static VReg *load_addr(Vector *irs, int pos, IR *ld, int64_t *pofs) {
 
 static void hoist_loop_invariants(RegAlloc *ra, BBContainer *bbcon) {
   int vreg_count = ra->vregs->len;
-  int *uses = malloc_or_die(sizeof(*uses) * vreg_count * 2);
-  int *defs = uses + vreg_count;
-  for (int i = 0; i < vreg_count * 2; ++i)
-    uses[i] = 0;
-  count_vreg_uses(bbcon, uses, defs);
+  int *uses = calloc_or_die(sizeof(*uses) * vreg_count);
+  int *defs = calloc_or_die(sizeof(*defs) * vreg_count);
+  count_vreg_uses_split(bbcon, uses, defs);
   unsigned char *inloop = malloc_or_die(vreg_count);
   unsigned char *hoisted = malloc_or_die(vreg_count);
   const int NG = VRF_CONST | VRF_PARAM | VRF_STACK_PARAM | VRF_FORCEMEMORY | VRF_VOLATILEREG |
@@ -1293,6 +1310,18 @@ static void hoist_loop_invariants(RegAlloc *ra, BBContainer *bbcon) {
     BB *latch = bbcon->data[j];
     if (latch->irs->len == 0)
       continue;
+    if (ra->vregs->len > vreg_count) {  // (registers made for constants below)
+      int n = ra->vregs->len;
+      uses = realloc_or_die(uses, sizeof(*uses) * n);
+      defs = realloc_or_die(defs, sizeof(*defs) * n);
+      inloop = realloc_or_die(inloop, n);
+      hoisted = realloc_or_die(hoisted, n);
+      for (int i = vreg_count; i < n; ++i) {
+        uses[i] = 2;  // (made once before a loop, used in it: moved no more)
+        defs[i] = 2;
+      }
+      vreg_count = n;
+    }
     IR *jmp = latch->irs->data[latch->irs->len - 1];
     if (jmp->kind != IR_JMP)
       continue;
@@ -1475,6 +1504,7 @@ static void hoist_loop_invariants(RegAlloc *ra, BBContainer *bbcon) {
   free(hoisted);
   free(inloop);
   free(uses);
+  free(defs);
 }
 
 // FPC: dead definitions: a computation whose result no later instruction

@@ -19,7 +19,8 @@ typedef struct TokenPoolChunk {
   size_t used;
 } TokenPoolChunk;
 
-#define TPC_HDR  ((sizeof(TokenPoolChunk) + 7) & ~(size_t)7)
+#define TP_ALIGN  16  // (a host's long double)
+#define TPC_HDR  ((sizeof(TokenPoolChunk) + TP_ALIGN - 1) & ~(size_t)(TP_ALIGN - 1))
 
 static TokenPoolChunk *tp_chunks;  // Newest first
 static TokenPoolChunk *tp_free;
@@ -28,7 +29,7 @@ static bool tp_on;
 void *token_pool_alloc(size_t size) {
   if (!tp_on)
     return calloc_or_die(size);
-  size = (size + 7) & ~(size_t)7;
+  size = (size + TP_ALIGN - 1) & ~(size_t)(TP_ALIGN - 1);
   assert(size <= TOKEN_POOL_CHUNK - TPC_HDR);
   TokenPoolChunk *c = tp_chunks;
   if (c == NULL || c->used + size > TOKEN_POOL_CHUNK) {

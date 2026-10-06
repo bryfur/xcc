@@ -378,7 +378,8 @@ static Expr *unary(Token *tok) {
           }
 #endif
           assert(is_fixnum(type));
-          expr->fixnum = wrap_value(-expr->fixnum, type_size(type), type->fixnum.is_unsigned);
+          expr->fixnum = wrap_value((Fixnum)(0 - (UFixnum)expr->fixnum), type_size(type),  // FPC: no UB
+                                    type->fixnum.is_unsigned);
           expr->type = type;
         }
         return expr;
