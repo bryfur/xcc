@@ -263,6 +263,7 @@ typedef struct BB {
   Vector *out_regs;  // <VReg*>
   Vector *assigned_regs;  // <VReg*>
   Vector *phis;
+  int index;  // FPC: its place in the function's blocks (where a pass sets it)
 } BB;
 
 extern BB *curbb;

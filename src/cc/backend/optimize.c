@@ -1254,6 +1254,29 @@ static bool costly_const(IR *ir, VReg *c, int which) {
 #endif
 }
 
+static bool defined_in(Vector *irs, int from, int to, VReg *v);
+
+// A load's address as base + offset: through an ADD/SUB of a constant just
+// before it in its block (what tweak_irs folds into the load later)
+static VReg *load_addr(Vector *irs, int pos, IR *ld, int64_t *pofs) {
+  VReg *a = ld->opr1;
+  *pofs = ld->load.offset;
+  for (int k = pos - 1; k >= 0; --k) {
+    IR *d = irs->data[k];
+    if (d->dst != a)
+      continue;
+    if ((d->kind == IR_ADD || d->kind == IR_SUB) && (d->opr2->flag & VRF_CONST) &&
+        !(d->opr2->flag & VRF_FLONUM) && !(d->opr1->flag & (VRF_CONST | VRF_FORCEMEMORY)) &&
+        (d->opr1->flag & VRF_UNALIGNED) == (a->flag & VRF_UNALIGNED) &&
+        !defined_in(irs, k + 1, pos, d->opr1)) {
+      *pofs += d->kind == IR_ADD ? d->opr2->fixnum : -d->opr2->fixnum;
+      return d->opr1;
+    }
+    break;
+  }
+  return a;
+}
+
 static void hoist_loop_invariants(RegAlloc *ra, BBContainer *bbcon) {
   int vreg_count = ra->vregs->len;
   int *uses = malloc_or_die(sizeof(*uses) * vreg_count * 2);
@@ -1367,10 +1390,54 @@ static void hoist_loop_invariants(RegAlloc *ra, BBContainer *bbcon) {
       }
     }
 
-    // Constants that cost at each use (a float's load...): in registers
-    // given them before the loop (innermost loops, a few)
     if (!inner)
       continue;
+
+    // A load in a loop that writes no memory, from an address it doesn't
+    // change, made already before it (its first test, in `pre`): its value
+    // from there (no speculative load: it was made anyway)
+    bool writes = false;
+    for (int k = h; k <= j && !writes; ++k) {
+      Vector *irs = ((BB*)bbcon->data[k])->irs;
+      for (int m = 0; m < irs->len && !writes; ++m)
+        writes = clobbers_memory(irs->data[m]);
+    }
+    for (int k = h; k <= j && !writes; ++k) {
+      Vector *irs = ((BB*)bbcon->data[k])->irs;
+      for (int m = 0; m < irs->len; ++m) {
+        IR *ir = irs->data[m];
+        if (ir->kind != IR_LOAD || ir->opr2 != NULL || ir->additional_operands != NULL ||
+            (ir->dst->flag & (VRF_FORCEMEMORY | VRF_VOLATILEREG)) ||
+            (ir->opr1->flag & (VRF_CONST | VRF_UNALIGNED)))
+          continue;
+        int64_t ofs;
+        VReg *base = load_addr(irs, m, ir, &ofs);
+        if ((base->flag & VRF_CONST) || inloop[base->virt])
+          continue;
+        Vector *pirs = pre->irs;
+        for (int q = pirs->len; --q >= 0; ) {
+          IR *pl = pirs->data[q];
+          if (clobbers_memory(pl) || pl->dst == base)
+            break;
+          int64_t pofs;
+          if (pl->kind == IR_LOAD && pl->opr2 == NULL && pl->additional_operands == NULL &&
+              pl->dst->vsize == ir->dst->vsize &&
+              (pl->dst->flag & VRF_MASK) == (ir->dst->flag & VRF_MASK) &&
+              pl->load.unaligned == ir->load.unaligned &&
+              !(pl->opr1->flag & (VRF_CONST | VRF_UNALIGNED)) &&
+              load_addr(pirs, q, pl, &pofs) == base && pofs == ofs &&
+              !inloop[pl->dst->virt] && !(pl->dst->flag & (VRF_FORCEMEMORY | VRF_VOLATILEREG)) &&
+              !defined_in(pirs, q + 1, pirs->len, pl->dst)) {
+            ir->kind = IR_MOV;
+            ir->opr1 = pl->dst;
+            break;
+          }
+        }
+      }
+    }
+
+    // Constants that cost at each use (a float's load...): in registers
+    // given them before the loop (innermost loops, a few)
     VReg *consts[6], *regs[6];
     int nconst = 0;
     for (int k = h; k <= j; ++k) {
@@ -2083,7 +2150,9 @@ static void kmap_track(RegAlloc *ra, Vector *m, BB *bb) {
       VReg *s = ir->opr1->flag & VRF_CONST ? ir->opr1 : kmap_get(m, ir->opr1);
       if (s != NULL) {
         int64_t v = wrap_value(s->fixnum, 1 << dst->vsize, (dst->flag & VRF_UNSIGNED) != 0);
-        c = reg_alloc_spawn_const(ra, v, dst->vsize, dst->flag & VRF_UNSIGNED);
+        c = v == s->fixnum && s->vsize == dst->vsize &&
+            (s->flag & VRF_UNSIGNED) == (dst->flag & VRF_UNSIGNED)
+                ? s : reg_alloc_spawn_const(ra, v, dst->vsize, dst->flag & VRF_UNSIGNED);
       }
     }
     kmap_set(m, dst, c);
@@ -2160,6 +2229,8 @@ static void kmap_edge(RegAlloc *ra, Vector *m, BB *q, BB *bb) {
 
 static Vector **known_in_maps(RegAlloc *ra, BBContainer *bbcon) {
   int n = bbcon->len;
+  for (int i = 0; i < n; ++i)
+    ((BB*)bbcon->data[i])->index = i;
   Vector **in = calloc_or_die(sizeof(*in) * (n + 1));
   Vector **out = calloc_or_die(sizeof(*out) * (n + 1));
   in[0] = new_vector();
@@ -2174,8 +2245,8 @@ static Vector **known_in_maps(RegAlloc *ra, BBContainer *bbcon) {
         Vector *meet = NULL;
         for (int f = 0; f < bb->from_bbs->len; ++f) {
           BB *q = bb->from_bbs->data[f];
-          int qi = bb_index_of(bbcon, q);
-          if (qi < 0 || out[qi] == NULL)
+          int qi = q->index;
+          if (qi < 0 || qi >= n || bbcon->data[qi] != q || out[qi] == NULL)
             continue;
           vec_clear(&tmp);
           vec_concat(&tmp, out[qi]);
@@ -2202,9 +2273,13 @@ static Vector **known_in_maps(RegAlloc *ra, BBContainer *bbcon) {
             VReg *o = kmap_get(in[i], meet->data[k]);
             same = o != NULL && kconst_equal(o, meet->data[k + 1]);
           }
-          if (same)
+          if (same) {
+            free_vector(meet);
             goto track;
+          }
         }
+        if (in[i] != NULL)
+          free_vector(in[i]);
         in[i] = meet;
         changed = true;
       }
@@ -2221,8 +2296,20 @@ static Vector **known_in_maps(RegAlloc *ra, BBContainer *bbcon) {
       break;
   }
   vec_release(&tmp);
+  for (int i = 0; i < n; ++i) {
+    if (out[i] != NULL)
+      free_vector(out[i]);
+  }
   free(out);
   return in;
+}
+
+static void free_known_in_maps(Vector **in, int n) {
+  for (int i = 0; i < n; ++i) {
+    if (in[i] != NULL)
+      free_vector(in[i]);
+  }
+  free(in);
 }
 
 // The constants known at the end of p: along its chain of only
@@ -2280,6 +2367,7 @@ static bool thread_jumps(RegAlloc *ra, BBContainer *bbcon) {
   BB **orig = malloc_or_die(sizeof(*orig) * (count + 1));
   for (int i = 0; i < count; ++i)
     orig[i] = bbcon->data[i];
+  int kin_len = bbcon->len;
   Vector **kin = known_in_maps(ra, bbcon);
   for (int i = 0; i < count && total < THREAD_FUNC_IRS; ++i) {
     BB *p = orig[i];
@@ -2409,11 +2497,12 @@ static bool thread_jumps(RegAlloc *ra, BBContainer *bbcon) {
       changed = true;
       // The facts again, with the new blocks
       detect_from_bbs(bbcon);
-      free(kin);
+      free_known_in_maps(kin, kin_len);
+      kin_len = bbcon->len;
       kin = known_in_maps(ra, bbcon);
     }
   }
-  free(kin);
+  free_known_in_maps(kin, kin_len);
   free(orig);
   free(uses);
   vec_release(&th.undo);
@@ -2583,6 +2672,7 @@ void optimize(RegAlloc *ra, BBContainer *bbcon) {
     remove_unnecessary_bb(bbcon);
     detect_from_bbs(bbcon);
     hoist_loop_invariants(ra, bbcon);  // FPC
+    coalesce_moves(ra, bbcon);  // FPC: the loads made MOVs
   }
   detect_from_bbs(bbcon);
 }
