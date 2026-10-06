@@ -1113,6 +1113,7 @@ static void hoist_loop_invariants(RegAlloc *ra, BBContainer *bbcon) {
     uses[i] = 0;
   count_vreg_uses(bbcon, uses, defs);
   unsigned char *inloop = malloc_or_die(vreg_count);
+  unsigned char *hoisted = malloc_or_die(vreg_count);
   const int NG = VRF_CONST | VRF_PARAM | VRF_STACK_PARAM | VRF_FORCEMEMORY | VRF_VOLATILEREG |
                  VRF_FLONUM | VRF_NO_SPILL;
 
@@ -1177,6 +1178,9 @@ static void hoist_loop_invariants(RegAlloc *ra, BBContainer *bbcon) {
     int at = pre->irs->len;
     if (at > 0 && ((IR*)pre->irs->data[at - 1])->kind == IR_JMP)
       --at;
+    int nhoisted = 0;
+    for (int i = 0; i < vreg_count; ++i)
+      hoisted[i] = false;
     for (int k = h; k <= j; ++k) {
       Vector *irs = ((BB*)bbcon->data[k])->irs;
       for (int m = 0; m < irs->len; ++m) {
@@ -1194,13 +1198,28 @@ static void hoist_loop_invariants(RegAlloc *ra, BBContainer *bbcon) {
         }
         if (!inv)
           continue;
+        // Worth a register through the loop: an address of a global (two
+        // instructions), a multiplication, or what is made from a value
+        // moved out already; not a base + constant (an address the
+        // load's offset takes), a few at most
+        bool worth = ir->kind == IR_IOFS || ir->kind == IR_MUL;
+        for (int o = 0; o < 2 && !worth; ++o) {
+          VReg *opr = oprs[o];
+          if (opr != NULL && !(opr->flag & VRF_CONST) && hoisted[opr->virt])
+            worth = true;
+        }
+        if (!worth || nhoisted >= 6)
+          continue;
         vec_remove_at(irs, m);
         --m;
         vec_insert(pre->irs, at++, ir);
         inloop[dst->virt] = false;
+        hoisted[dst->virt] = true;
+        ++nhoisted;
       }
     }
   }
+  free(hoisted);
   free(inloop);
   free(uses);
 }

@@ -1268,6 +1268,34 @@ static void fuse_indexed_access(RegAlloc *ra, BBContainer *bbcon) {
     for (int j = 0; j < irs->len; ++j) {
       IR *ir = irs->data[j];
       VReg *addr, *value = NULL;
+
+      // base + constant: the constant in the instruction's offset (any load
+      // or store: the emitter copes with an offset out of range)
+      for (;;) {
+        VReg *a = ir->kind == IR_LOAD && ir->opr2 == NULL ? ir->opr1 :
+                  ir->kind == IR_STORE && ir->additional_operands == NULL ? ir->opr2 : NULL;
+        if (a == NULL || !plain_reg(a) || uses[a->virt] != 1 || defs[a->virt] != 1 ||
+            (a->flag & VRF_PARAM))
+          break;
+        int k;
+        IR *add = def_in_bb(irs, j, a, &k);
+        if (add == NULL || (add->kind != IR_ADD && add->kind != IR_SUB) || !plain_reg(add->opr1) ||
+            !(add->opr2->flag & VRF_CONST) || defined_between(irs, k, j, add->opr1) ||
+            (add->opr1->flag & VRF_UNALIGNED) != (a->flag & VRF_UNALIGNED))
+          break;
+        int64_t c = add->kind == IR_ADD ? add->opr2->fixnum : -add->opr2->fixnum;
+        if (ir->kind == IR_LOAD) {
+          ir->opr1 = add->opr1;
+          ir->load.offset += c;
+        } else {
+          ir->opr2 = add->opr1;
+          ir->store.offset += c;
+        }
+        ++uses[add->opr1->virt];
+        vec_remove_at(irs, k);
+        --j;
+      }
+
       if (ir->kind == IR_LOAD) {
         if (ir->opr2 != NULL || ir->load.unaligned || ir->load.offset != 0 ||
             (ir->dst->flag & VRF_FLONUM) || ir->dst->vsize > VRegSize4)

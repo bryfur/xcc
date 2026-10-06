@@ -678,7 +678,7 @@ static int rotatable_cond_cost(Expr *e) {
 }
 
 static bool rotatable_cond(Expr *cond) {
-  return cond != NULL && rotatable_cond_cost(cond) <= 8;
+  return cond != NULL && rotatable_cond_cost(cond) <= 16;
 }
 
 static void gen_while(Stmt *stmt) {
