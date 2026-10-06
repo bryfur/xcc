@@ -59,6 +59,15 @@ static int saved_core_regs_leaf(RegBits used, char *buf, size_t bufsize, bool le
   // (allocation index 11), and not lr
   regs[7] = !leaf || (used & REGBIT(11));
   regs[14] = !leaf;
+  if (!leaf) {
+    // An even count keeps the stack 8-byte aligned without a sub sp: r3
+    // (scratch: no result is in it) pads the list
+    int n = 0;
+    for (int r = 0; r < 16; ++r)
+      n += regs[r];
+    if (n & 1)
+      regs[3] = true;
+  }
   int count = 0;
   size_t len = 0;
   buf[0] = '\0';
