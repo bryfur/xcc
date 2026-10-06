@@ -37,6 +37,13 @@ enum UnresolvedKind {
   UNRES_RISCV_RVC_BRANCH,
   UNRES_RISCV_RVC_JUMP,
   UNRES_RISCV_RELAX,
+
+  // FPC: ARM32 (REL: the addend is in the instruction or the word)
+  UNRES_ARM_ABS32,
+  UNRES_ARM_THM_CALL,
+  UNRES_ARM_THM_JUMP24,
+  UNRES_ARM_THM_MOVW,
+  UNRES_ARM_THM_MOVT,
 };
 
 typedef struct {

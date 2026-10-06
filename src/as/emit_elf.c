@@ -1,6 +1,6 @@
 #include "../config.h"
 
-#if XCC_TARGET_PLATFORM != XCC_PLATFORM_APPLE
+#if XCC_TARGET_PLATFORM != XCC_PLATFORM_APPLE && XCC_TARGET_ARCH != XCC_ARCH_ARM32
 #include <assert.h>
 #include <stdint.h>  // uint64_t
 #include <stdio.h>

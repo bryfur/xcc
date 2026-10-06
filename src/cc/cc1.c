@@ -55,6 +55,19 @@ static void usage(FILE *fp) {
 }
 
 int main(int argc, char *argv[]) {
+  FILE *ofp = stdout;
+  // FPC: -o FILE (the output: a driver in the same process can't take stdout)
+  for (int i = 1; i + 1 < argc; ++i) {
+    if (strcmp(argv[i], "-o") == 0) {
+      ofp = fopen(argv[i + 1], "w");
+      if (ofp == NULL)
+        error("Cannot open output file: %s\n", argv[i + 1]);
+      memmove(&argv[i], &argv[i + 2], (argc - i - 1) * sizeof(*argv));
+      argc -= 2;
+      break;
+    }
+  }
+
   enum {
     OPT_HELP = 128,
     OPT_VERSION,
@@ -167,7 +180,7 @@ int main(int argc, char *argv[]) {
 
   // Compile.
   Vector *toplevel = new_vector();
-  init_compiler(toplevel, stdout);
+  init_compiler(toplevel, ofp);
 
   int iarg = optind;
   if (iarg >= argc)
@@ -193,5 +206,7 @@ int main(int argc, char *argv[]) {
   gen(toplevel);
   emit_code(toplevel);
 
+  if (ofp != stdout)
+    fclose(ofp);
   return 0;
 }

@@ -21,6 +21,17 @@ static void usage(FILE *fp) {
 
 int main(int argc, char *argv[]) {
   FILE *ofp = stdout;
+  // FPC: -o FILE (the output: a driver in the same process can't take stdout)
+  for (int i = 1; i + 1 < argc; ++i) {
+    if (strcmp(argv[i], "-o") == 0) {
+      ofp = fopen(argv[i + 1], "w");
+      if (ofp == NULL)
+        error("Cannot open output file: %s\n", argv[i + 1]);
+      memmove(&argv[i], &argv[i + 2], (argc - i - 1) * sizeof(*argv));
+      argc -= 2;
+      break;
+    }
+  }
   init_preprocessor(ofp);
 
   enum {
@@ -89,5 +100,7 @@ int main(int argc, char *argv[]) {
   } else {
     preprocess(stdin, "*stdin*");
   }
+  if (ofp != stdout)
+    fclose(ofp);
   return 0;
 }

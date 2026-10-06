@@ -154,10 +154,10 @@ char *im(int64_t x) {
 bool is_thumb_modimm(uint32_t x) {
   if (x <= 0xff)
     return true;
-  uint32_t b = x & 0xff;
+  uint32_t b = x & 0xff, b2 = (x >> 8) & 0xff;
   if (x == (b | (b << 16)))
     return true;
-  if (x == ((b << 8) | (b << 24)))
+  if (x == ((b2 << 8) | (b2 << 24)))
     return true;
   if (x == (b | (b << 8) | (b << 16) | (b << 24)))
     return true;

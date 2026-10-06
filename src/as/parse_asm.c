@@ -23,6 +23,8 @@
 #include "./arch/aarch64/inst.h"
 #elif XCC_TARGET_ARCH == XCC_ARCH_RISCV64
 #include "./arch/riscv64/inst.h"
+#elif XCC_TARGET_ARCH == XCC_ARCH_ARM32
+#include "./arch/arm32/inst.h"
 #else
 #error "Unsupported architecture"
 #endif
@@ -76,6 +78,16 @@ static const char *kDirectiveTable[] = {
 #endif
 #if XCC_TARGET_PLATFORM == XCC_PLATFORM_APPLE
   "subsections_via_symbols",
+#endif
+#if XCC_TARGET_ARCH == XCC_ARCH_ARM32
+  // FPC
+  "word",
+  "syntax",
+  "cpu",
+  "fpu",
+  "thumb",
+  "thumb_func",
+  "eabi_attribute",
 #endif
 };
 
@@ -611,6 +623,10 @@ static /*enum RawOpcode*/int find_raw_opcode(ParseInfo *parser) {
 }
 
 static bool parse_inst(ParseInfo *parser, Line *line) {
+#if XCC_TARGET_ARCH == XCC_ARCH_ARM32
+  extern bool arm32_parse_inst(ParseInfo *parser, Line *line);
+  return arm32_parse_inst(parser, line);  // FPC
+#endif
   Inst inst;
   inst.op = NOOP;
   for (int i = 0; i < (int)ARRAY_SIZE(inst.opr); ++i)
@@ -923,10 +939,10 @@ static bool dir_type(ParseInfo *parser, enum DirectiveType dir) {
     return parse_error(parser, ".type: `,' expected");
   parser->p = skip_whitespaces(parser->p + 1);
   enum LabelKind kind = LK_NONE;
-  if (strcmp(parser->p, "@function") == 0) {
+  if (strcmp(parser->p, "@function") == 0 || strcmp(parser->p, "%function") == 0) {
     kind = LK_FUNC;
     parser->p += 9;
-  } else if (strcmp(parser->p, "@object") == 0) {
+  } else if (strcmp(parser->p, "@object") == 0 || strcmp(parser->p, "%object") == 0) {
     kind = LK_OBJECT;
     parser->p += 7;
   } else {
@@ -942,6 +958,10 @@ static bool dir_type(ParseInfo *parser, enum DirectiveType dir) {
 }
 
 static bool dir_bytes(ParseInfo *parser, enum DirectiveType dir) {
+#if XCC_TARGET_ARCH == XCC_ARCH_ARM32
+  if (dir == DT_WORD)
+    dir = DT_LONG;
+#endif
   Expr *expr = parse_expr(parser);
   if (expr == NULL)
     return parse_error(parser, "expression expected");
@@ -952,7 +972,7 @@ static bool dir_bytes(ParseInfo *parser, enum DirectiveType dir) {
   assert(expr->kind != EX_FLONUM);
   if (expr->kind == EX_FIXNUM) {
     // TODO: Target endian.
-    long value = expr->fixnum;
+    int64_t value = expr->fixnum;  // FPC: was long (32 bits on a 32-bit host)
     int size = 1 << (dir - DT_BYTE);
     unsigned char *buf = malloc_or_die(size);
     for (int i = 0; i < size; ++i)
@@ -1095,6 +1115,38 @@ static bool dir_subsections_via_symbols(ParseInfo *parser, enum DirectiveType di
 }
 #endif
 
+#if XCC_TARGET_ARCH == XCC_ARCH_ARM32
+// FPC: .syntax, .cpu, .fpu, .thumb, .thumb_func: what this assembler is
+// anyway (every function's symbol is Thumb: .type %function).
+static bool dir_ignore(ParseInfo *parser, enum DirectiveType dir) {
+  UNUSED(dir);
+  parser->p += strlen(parser->p);
+  return true;
+}
+
+// .eabi_attribute TAG, VALUE: for .ARM.attributes (emit_elf_arm32.c)
+static bool dir_eabi_attribute(ParseInfo *parser, enum DirectiveType dir) {
+  extern Vector *arm32_eabi_attributes;
+  UNUSED(dir);
+  int64_t tag, value;
+  const char *p = skip_whitespaces(parser->p);
+  if (!immediate(&p, &tag))
+    return parse_error(parser, "tag expected");
+  p = skip_whitespaces(p);
+  if (*p != ',')
+    return parse_error(parser, "`,' expected");
+  p = skip_whitespaces(p + 1);
+  if (!immediate(&p, &value))
+    return parse_error(parser, "value expected");
+  parser->p = p;
+  if (arm32_eabi_attributes == NULL)
+    arm32_eabi_attributes = new_vector();
+  vec_push(arm32_eabi_attributes, (void*)(intptr_t)tag);
+  vec_push(arm32_eabi_attributes, (void*)(intptr_t)value);
+  return true;
+}
+#endif
+
 static inline bool handle_directive(ParseInfo *parser, enum DirectiveType dir) {
   typedef bool (*DirectiveFunc)(ParseInfo *parser, enum DirectiveType dir);
 
@@ -1118,6 +1170,12 @@ static inline bool handle_directive(ParseInfo *parser, enum DirectiveType dir) {
   #endif
   #if XCC_TARGET_PLATFORM == XCC_PLATFORM_APPLE
     [DT_SUBSECTIONS_VIA_SYMBOLS] = dir_subsections_via_symbols,
+  #endif
+  #if XCC_TARGET_ARCH == XCC_ARCH_ARM32
+    [DT_WORD] = dir_bytes,
+    [DT_SYNTAX] = dir_ignore, [DT_CPU] = dir_ignore, [DT_FPU] = dir_ignore,
+    [DT_THUMB] = dir_ignore, [DT_THUMB_FUNC] = dir_ignore,
+    [DT_EABI_ATTRIBUTE] = dir_eabi_attribute,
   #endif
   };
 
