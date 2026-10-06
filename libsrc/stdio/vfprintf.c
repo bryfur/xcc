@@ -69,9 +69,14 @@ static char *snprintullong2(char *bufend, unsigned long long x, int base, const 
 
 static int snprintstr(FILE *fp, const char *s, int order, int suborder, bool leftalign,
                       char padding) {
-  size_t len = strlen(s);
-  if (suborder > 0)
-    len = MIN(len, (unsigned int)suborder);
+  // FPC: no further than the precision (the string need not end before)
+  size_t len = 0;
+  if (suborder > 0) {
+    while (len < (unsigned int)suborder && s[len] != '\0')
+      ++len;
+  } else {
+    len = strlen(s);
+  }
   if (order <= 0 || len >= (unsigned int)order) {
     putnstr(fp, len, s);
     return len;

@@ -47,7 +47,7 @@ static const int kCalleeSaveRegs[] = {4, 5, 6, 7, 8, 9, 10};
 
 // The registers a function pushes, in ascending register number: a
 // register list "{r4, r5, r7, lr}" and their count.
-static int saved_core_regs(RegBits used, char *buf, size_t bufsize) {
+static int saved_core_regs_leaf(RegBits used, char *buf, size_t bufsize, bool leaf) {
   static const int kRegNo[] = {[4] = 4, [5] = 5, [6] = 6, [7] = 8, [8] = 9, [9] = 10, [10] = 11};
   bool regs[16] = {false};
   for (size_t i = 0; i < ARRAY_SIZE(kCalleeSaveRegs); ++i) {
@@ -55,8 +55,10 @@ static int saved_core_regs(RegBits used, char *buf, size_t bufsize) {
     if (used & REGBIT(idx))
       regs[kRegNo[idx]] = true;
   }
-  regs[7] = true;
-  regs[14] = true;
+  // FPC: a leaf function (no calls, no frame) saves r7 only when it uses it
+  // (allocation index 11), and not lr
+  regs[7] = !leaf || (used & REGBIT(11));
+  regs[14] = !leaf;
   int count = 0;
   size_t len = 0;
   buf[0] = '\0';
@@ -68,6 +70,24 @@ static int saved_core_regs(RegBits used, char *buf, size_t bufsize) {
     ++count;
   }
   return count;
+}
+
+static int saved_core_regs(RegBits used, char *buf, size_t bufsize) {
+  return saved_core_regs_leaf(used, buf, bufsize, false);
+}
+
+// FPC: whether a function calls anything (a function, a run-time helper)
+static bool makes_calls(BBContainer *bbcon) {
+  for (int i = 0; i < bbcon->len; ++i) {
+    BB *bb = bbcon->data[i];
+    for (int j = 0; j < bb->irs->len; ++j) {
+      IR *ir = bb->irs->data[j];
+      if (ir->kind == IR_CALL || ir->kind == IR_ASM || ir->kind == IR_SUBSP ||
+          arm32_ir_calls_helper(ir))
+        return true;
+    }
+  }
+  return false;
 }
 
 // VFP callee-saved: s16 up to the highest used (vpush takes a range).
@@ -240,18 +260,22 @@ void emit_defun_body(Function *func) {
   }
 
   bool vaargs = aapcs_spills_regargs(func);  // r0-r3 pushed on entry
+  bool fp_saved = fnbe->frame_size > 0 || (fnbe->ra->flag & RAF_STACK_FRAME);
+  // FPC: a leaf (no calls, nothing on the stack) pushes only the callee-saved
+  // registers it uses; no lr, no 8-byte alignment (it calls nothing)
+  bool leaf = !vaargs && !fp_saved && funcall_work_size == 0 && !makes_calls(fnbe->bbcon);
   char saves[64];
-  int ncore = saved_core_regs(fnbe->ra->used_reg_bits[GPREG], saves, sizeof(saves));
+  int ncore = saved_core_regs_leaf(fnbe->ra->used_reg_bits[GPREG], saves, sizeof(saves), leaf);
   int nvfp = saved_vfp_count(fnbe->ra->used_reg_bits[FPREG]);
   int pushed = 4 * ncore + 4 * nvfp + (vaargs ? 16 : 0);
-  size_t frame_size = ALIGN8(fnbe->frame_size + funcall_work_size + pushed) - pushed;
-  bool fp_saved = fnbe->frame_size > 0 || (fnbe->ra->flag & RAF_STACK_FRAME);
+  size_t frame_size = leaf ? 0 : ALIGN8(fnbe->frame_size + funcall_work_size + pushed) - pushed;
 
   if (!no_stmt) {
     // Prologue
     if (vaargs)
       EMIT_ASM("push", "{r0, r1, r2, r3}");
-    EMIT_ASM("push", fmt("{%s}", saves));
+    if (ncore > 0)
+      EMIT_ASM("push", fmt("{%s}", saves));
     if (nvfp > 0)
       EMIT_ASM("vpush", nvfp == 1 ? "{s16}" : fmt("{s16-s%d}", 16 + nvfp - 1));
     if (fp_saved)
@@ -285,6 +309,12 @@ void emit_defun_body(Function *func) {
       }
       if (nvfp > 0)
         EMIT_ASM("vpop", nvfp == 1 ? "{s16}" : fmt("{s16-s%d}", 16 + nvfp - 1));
+      if (leaf) {
+        if (ncore > 0)
+          EMIT_ASM("pop", fmt("{%s}", saves));
+        EMIT_ASM("bx", LR);
+        return;
+      }
       if (!vaargs) {
         // lr comes back as pc: the return.
         size_t len = strlen(saves);

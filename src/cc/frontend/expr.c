@@ -128,7 +128,8 @@ Expr *make_cast(Type *type, const Token *token, Expr *sub, bool is_explicit) {
       if (is_bool(type))
         value = sub->fixnum != 0;
       else
-        value = wrap_value(sub->fixnum, type_size(type), type->fixnum.is_unsigned);
+        value = wrap_value(sub->fixnum, type_size(type),
+                           type->kind != TY_FIXNUM || type->fixnum.is_unsigned);  // FPC: a pointer
       sub->fixnum = value;
       sub->type = type;
       return sub;
