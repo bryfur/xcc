@@ -3173,6 +3173,94 @@ static void bit_simplify(RegAlloc *ra, BBContainer *bbcon) {
   free(uses);
 }
 
+// FPC: v = MOV t, t made in the block falling into this one (its only
+// predecessor) and used only there and here before the MOV: t's making
+// writes v instead (a load known again across a test: the state machine's
+// next character), if v isn't read or written in between nor live where
+// the predecessor's jump goes.
+static bool vec_has(Vector *v, void *x) {
+  for (int i = 0; i < v->len; ++i) {
+    if (v->data[i] == x)
+      return true;
+  }
+  return false;
+}
+
+static void coalesce_across_fall(RegAlloc *ra, BBContainer *bbcon) {
+  int vreg_count = ra->vregs->len;
+  int *uses = calloc_or_die(sizeof(*uses) * vreg_count * 2);
+  int *defs = uses + vreg_count;
+  count_vreg_uses(bbcon, uses, defs);
+  detect_from_bbs(bbcon);
+  analyze_reg_flow(bbcon);
+  for (int ib = 1; ib < bbcon->len; ++ib) {
+    BB *b = bbcon->data[ib], *a = bbcon->data[ib - 1];
+    if (a->next != b || b->from_bbs->len != 1 || b->from_bbs->data[0] != a)
+      continue;
+    IR *alast = a->irs->len > 0 ? a->irs->data[a->irs->len - 1] : NULL;
+    BB *target = NULL;
+    if (alast != NULL && alast->kind == IR_TJMP)
+      continue;
+    if (alast != NULL && alast->kind == IR_JMP) {
+      if (alast->jmp.cond == COND_ANY)
+        continue;
+      target = alast->jmp.bb;
+    }
+    for (int j = 0; j < b->irs->len; ++j) {
+      IR *mov = b->irs->data[j];
+      VReg *v = mov->dst, *t = mov->opr1;
+      if (mov->kind != IR_MOV || v == NULL || t == NULL || (t->flag & VRF_CONST) ||
+          !coalescable(t, v) || defs[t->virt] != 1 || v->virt >= vreg_count)
+        continue;
+      int k = def_index(a->irs, a->irs->len, t);
+      if (k < 0)
+        continue;
+      // t's uses: after its making in a, in b before the MOV
+      int seen = 0;
+      bool ok = true;
+      for (int m = k + 1; m < a->irs->len && ok; ++m) {
+        IR *x = a->irs->data[m];
+        seen += (x->opr1 == t) + (x->opr2 == t);
+        if (x->additional_operands != NULL)
+          ok = false;
+        if (x->dst == v || ir_reads(x, v))
+          ok = false;
+      }
+      for (int m = 0; m <= j && ok; ++m) {
+        IR *x = b->irs->data[m];
+        seen += (x->opr1 == t) + (x->opr2 == t);
+        if (x->additional_operands != NULL && m < j)
+          ok = false;
+        if (m < j && (x->dst == v || ir_reads(x, v)))
+          ok = false;
+      }
+      if (!ok || seen != uses[t->virt] || (target != NULL && vec_has(target->in_regs, v)))
+        continue;
+      IR *d = a->irs->data[k];
+      d->dst = v;
+      for (int m = k + 1; m < a->irs->len; ++m) {
+        IR *x = a->irs->data[m];
+        if (x->opr1 == t)
+          x->opr1 = v;
+        if (x->opr2 == t)
+          x->opr2 = v;
+      }
+      for (int m = 0; m < j; ++m) {
+        IR *x = b->irs->data[m];
+        if (x->opr1 == t)
+          x->opr1 = v;
+        if (x->opr2 == t)
+          x->opr2 = v;
+      }
+      vec_remove_at(b->irs, j);
+      --j;
+      uses[t->virt] = 0;
+      defs[t->virt] = 0;
+    }
+  }
+  free(uses);
+}
+
 static void cond_flow(RegAlloc *ra, BBContainer *bbcon) {
   for (int pass = 0; pass < 3; ++pass) {
     bool changed = cond_diamonds(bbcon);
@@ -3280,7 +3368,7 @@ void optimize(RegAlloc *ra, BBContainer *bbcon) {
     TIMED(7, "unused", remove_unused_vregs(ra, bbcon));
     TIMED(8, "bbs", remove_unnecessary_bb(bbcon); detect_from_bbs(bbcon));
     TIMED(9, "licm", hoist_loop_invariants(ra, bbcon));  // FPC
-    TIMED(10, "coalesce3", coalesce_moves(ra, bbcon));  // FPC: the loads made MOVs
+    TIMED(10, "coalesce3", coalesce_moves(ra, bbcon); coalesce_across_fall(ra, bbcon));  // FPC: the loads made MOVs
   }
   detect_from_bbs(bbcon);
 }
