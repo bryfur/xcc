@@ -1847,6 +1847,9 @@ typedef struct {
 typedef struct {
   RegAlloc *ra;
   VReg **known;     // [virt]: a constant, or NULL
+  int known_len;
+  bool walking;     // On the path: constants assigned there are not known
+                    // (deciding on them is the work of their own block)
   Vector undo;      // <(virt, old)> to put known back
   ThreadStep steps[THREAD_MAX_BBS];       // The path walked
   ThreadStep best_steps[THREAD_MAX_BBS];  // The best: to its last decision
@@ -1854,6 +1857,10 @@ typedef struct {
   BB *best_dest;    // and where it leads
   int budget;
 } Thread;
+
+static int ra_vreg_count(RegAlloc *ra) {
+  return ra->vregs->len;
+}
 
 static void thread_set(Thread *th, VReg *v, VReg *c) {
   vec_push(&th->undo, INT2VOIDP(v->virt));
@@ -1886,7 +1893,8 @@ static void thread_track(Thread *th, IR *ir) {
     return;
   int64_t v;
   if ((ir->kind == IR_MOV || ir->kind == IR_CAST) && plain_int_vreg(dst) &&
-      dst->vsize <= VRegSize4 && ir->opr1->vsize <= VRegSize4 && thread_value(th, ir->opr1, &v)) {
+      dst->vsize <= VRegSize4 && ir->opr1->vsize <= VRegSize4 &&
+      !(th->walking && (ir->opr1->flag & VRF_CONST)) && thread_value(th, ir->opr1, &v)) {
     v = wrap_value(v, 1 << dst->vsize, (dst->flag & VRF_UNSIGNED) != 0);
     thread_set(th, dst, reg_alloc_spawn_const(th->ra, v, dst->vsize, dst->flag & VRF_UNSIGNED));
   } else if (th->known[dst->virt] != NULL) {
@@ -1984,6 +1992,60 @@ static IR *copy_ir(IR *ir) {
   return c;
 }
 
+// Constants known on entering a block from its only predecessor: a table
+// jump's index (a switch's case), a jump on x == c (and the register x was
+// copied from just before)
+static void thread_entry_known(Thread *th, BB *bb) {
+  if (bb->from_bbs->len != 1)
+    return;
+  BB *q = bb->from_bbs->data[0];
+  Vector *qirs = q->irs;
+  if (qirs->len == 0)
+    return;
+  IR *last = qirs->data[qirs->len - 1];
+  VReg *v;
+  int64_t c;
+  if (last->kind == IR_TJMP) {
+    int idx = -1, n = 0;
+    for (size_t k = 0; k < last->tjmp.len; ++k) {
+      if (last->tjmp.bbs[k] == bb) {
+        idx = (int)k;
+        ++n;
+      }
+    }
+    if (n != 1)
+      return;
+    v = last->opr1;
+    c = idx;
+  } else if (last->kind == IR_JMP && (last->jmp.cond == COND_EQ || last->jmp.cond == COND_NE) &&
+             last->opr2 != NULL && (last->opr2->flag & VRF_CONST) &&
+             !(last->opr2->flag & VRF_FLONUM) && !(last->opr1->flag & VRF_CONST)) {
+    bool taken = last->jmp.bb == bb && q->next != bb;
+    bool falls = q->next == bb && last->jmp.bb != bb;
+    if (!(last->jmp.cond == COND_EQ ? taken : falls))
+      return;
+    v = last->opr1;
+    c = last->opr2->fixnum;
+  } else {
+    return;
+  }
+  if (!plain_int_vreg(v) || v->vsize > VRegSize4 || v->virt >= ra_vreg_count(th->ra))
+    return;
+  int64_t cv = wrap_value(c, 1 << v->vsize, (v->flag & VRF_UNSIGNED) != 0);
+  thread_set(th, v, reg_alloc_spawn_const(th->ra, cv, v->vsize, v->flag & VRF_UNSIGNED));
+  for (int j = qirs->len - 2; j >= 0; --j) {
+    IR *ir = qirs->data[j];
+    if (ir->dst != v)
+      continue;
+    VReg *x = ir->opr1;
+    if ((ir->kind == IR_MOV || ir->kind == IR_CAST) && plain_int_vreg(x) &&
+        x->vsize == v->vsize && (x->flag & VRF_UNSIGNED) == (v->flag & VRF_UNSIGNED) &&
+        !defined_in(qirs, j + 1, qirs->len, x) && x->virt < ra_vreg_count(th->ra))
+      thread_set(th, x, th->known[v->virt]);
+    break;
+  }
+}
+
 // A temporary defined and used only in its block: its copy gets a register
 // of its own (a temporary stays defined once: CSE, coalescing)
 static void rename_local_temps(RegAlloc *ra, Vector *irs, int from, int *uses, int *defs,
@@ -2023,6 +2085,57 @@ static void rename_local_temps(RegAlloc *ra, Vector *irs, int from, int *uses, i
   }
 }
 
+// The constants known at the end of p: along its chain of only
+// predecessors (a few), what the jumps between them say and what they do
+static bool thread_known_at_end(Thread *th, BB *p) {
+  BB *chain[5];
+  int n = 0;
+  chain[n++] = p;
+  for (BB *b = p; n < 5 && b->from_bbs->len == 1; ) {
+    BB *q = b->from_bbs->data[0];
+    bool seen = false;
+    for (int k = 0; k < n; ++k)
+      seen |= chain[k] == q;
+    if (seen)
+      break;
+    chain[n++] = q;
+    b = q;
+  }
+  for (int k = n; --k >= 0; ) {
+    BB *b = chain[k];
+    thread_entry_known(th, b);
+    for (int j = 0; j < b->irs->len; ++j)
+      thread_track(th, b->irs->data[j]);
+  }
+  for (int k = 0; k < th->known_len; ++k) {
+    if (th->known[k] != NULL)
+      return true;
+  }
+  return false;
+}
+
+// What the edge of p's conditional jump to `to` says: x == c
+static void thread_edge_known(Thread *th, BB *p, IR *jmp, BB *to) {
+  VReg *x = jmp->opr1, *c = jmp->opr2;
+  if (c == NULL || !(c->flag & VRF_CONST) || (c->flag & VRF_FLONUM) || !plain_int_vreg(x) ||
+      x->vsize > VRegSize4 || x->virt >= th->known_len)
+    return;
+  bool taken = to == jmp->jmp.bb;
+  if ((jmp->jmp.cond == COND_EQ && taken) || (jmp->jmp.cond == COND_NE && !taken)) {
+    int64_t v = wrap_value(c->fixnum, 1 << x->vsize, (x->flag & VRF_UNSIGNED) != 0);
+    thread_set(th, x, reg_alloc_spawn_const(th->ra, v, x->vsize, x->flag & VRF_UNSIGNED));
+  }
+  (void)p;
+}
+
+static int bb_index_of(BBContainer *bbcon, BB *bb) {
+  for (int k = 0; k < bbcon->len; ++k) {
+    if (bbcon->data[k] == bb)
+      return k;
+  }
+  return -1;
+}
+
 static bool thread_jumps(RegAlloc *ra, BBContainer *bbcon) {
   Thread th = {.ra = ra};
   vec_init(&th.undo);
@@ -2031,6 +2144,7 @@ static bool thread_jumps(RegAlloc *ra, BBContainer *bbcon) {
   int *uses = calloc_or_die(sizeof(*uses) * nvregs * 2);
   int *defs = uses + nvregs;
   count_vreg_uses(bbcon, uses, defs);
+  detect_from_bbs(bbcon);
   int total = 0;
   int count = bbcon->len;
   BB **orig = malloc_or_die(sizeof(*orig) * (count + 1));
@@ -2038,86 +2152,132 @@ static bool thread_jumps(RegAlloc *ra, BBContainer *bbcon) {
     orig[i] = bbcon->data[i];
   for (int i = 0; i < count && total < THREAD_FUNC_IRS; ++i) {
     BB *p = orig[i];
-    Vector *irs = p->irs;
-    IR *last = irs->len > 0 ? irs->data[irs->len - 1] : NULL;
-    if (irs->len == 0 || (last->kind == IR_JMP && last->jmp.cond != COND_ANY) ||
-        last->kind == IR_TJMP)
-      continue;
-    BB *succ = last->kind == IR_JMP ? last->jmp.bb : p->next;
-    if (succ == NULL || succ == p)
-      continue;
-    // The constants known at its end
-    th.known = calloc_or_die(sizeof(*th.known) * ra->vregs->len);
-    bool any = false;
-    for (int j = 0; j < irs->len; ++j) {
-      IR *ir = irs->data[j];
-      thread_track(&th, ir);
-      if (ir->dst != NULL && !(ir->dst->flag & VRF_CONST) && th.known[ir->dst->virt] != NULL)
-        any = true;
-    }
-    vec_clear(&th.undo);
-    if (!any) {
-      free(th.known);
-      continue;
-    }
-    th.best = 0;
-    th.best_dest = NULL;
-    th.budget = THREAD_MAX_IRS;
-    th.steps[0].bb = p;  // (not on the path: a loop back to it stops there)
-    thread_walk(&th, succ, 0);
-    if (th.best == 0 || th.best_dest == NULL) {
-      free(th.known);
-      continue;
-    }
-    // The copies after p
-    if (last->kind == IR_JMP)
-      vec_pop(irs);
-    BB *cur = p, *after = p->next;
-    int at = 0;
-    for (int k = 0; k < bbcon->len; ++k) {
-      if (bbcon->data[k] == p) {
-        at = k;
+    for (int edge = 0; edge < 2 && total < THREAD_FUNC_IRS; ++edge) {
+      Vector *irs = p->irs;
+      IR *last = irs->len > 0 ? irs->data[irs->len - 1] : NULL;
+      if (last != NULL && last->kind == IR_TJMP)
         break;
+      // mode 0: p falls or jumps on (the copies go at its end); 1: the
+      // jump's target edge, 2: its fall edge (the copies in a block of
+      // their own on the edge)
+      int mode;
+      BB *succ;
+      if (last == NULL || last->kind != IR_JMP || last->jmp.cond == COND_ANY) {
+        if (edge > 0)
+          break;
+        mode = 0;
+        succ = last != NULL && last->kind == IR_JMP ? last->jmp.bb : p->next;
+      } else {
+        if (last->jmp.cond == COND_NONE || last->opr1 == NULL ||
+            ((last->opr1->flag | (last->opr2 != NULL ? last->opr2->flag : 0)) & VRF_FLONUM) ||
+            last->jmp.bb == p->next)
+          break;
+        mode = edge == 0 ? 1 : 2;
+        succ = mode == 1 ? last->jmp.bb : p->next;
       }
-    }
-    for (int s = 0; s < th.best; ++s) {
-      BB *bb = th.best_steps[s].bb;
-      Vector *birs = bb->irs;
-      IR *blast = birs->len > 0 ? birs->data[birs->len - 1] : NULL;
-      bool term = blast != NULL && (blast->kind == IR_JMP || blast->kind == IR_TJMP);
-      int n = birs->len - (term ? 1 : 0);
-      int from = cur->irs->len;
-      for (int j = 0; j < n; ++j) {
-        vec_push(cur->irs, copy_ir(birs->data[j]));
-        ++total;
+      if (succ == NULL || succ == p)
+        continue;
+      th.known = calloc_or_die(sizeof(*th.known) * (ra->vregs->len + 1));
+      th.known_len = ra->vregs->len;
+      bool any = thread_known_at_end(&th, p);
+      if (mode != 0) {
+        thread_edge_known(&th, p, last, succ);
+        for (int k = 0; k < th.known_len && !any; ++k)
+          any = th.known[k] != NULL;
       }
-      int how = th.best_steps[s].how;
-      IR *jcopy = NULL;
-      if (how == 2 || how == 3) {  // (its test reads its temporaries too)
-        jcopy = copy_ir(blast);
-        vec_push(cur->irs, jcopy);
+      vec_clear(&th.undo);
+      if (!any) {
+        free(th.known);
+        continue;
       }
-      rename_local_temps(ra, cur->irs, from, uses, defs, nvregs);
-      if (jcopy != NULL)
-        vec_pop(cur->irs);
-      if (jcopy != NULL) {
-        IR *j = jcopy;
-        if (how == 3) {
-          j->jmp.cond = invert_cond(j->jmp.cond);
-          j->jmp.bb = bb->next;
+      th.best = 0;
+      th.best_dest = NULL;
+      th.budget = THREAD_MAX_IRS;
+      th.walking = true;
+      thread_walk(&th, succ, 0);
+      th.walking = false;
+      if (th.best == 0 || th.best_dest == NULL) {
+        free(th.known);
+        continue;
+      }
+      // Where the copies go
+      BB *cur, *after;
+      int at;
+      if (mode == 0) {
+        if (last != NULL && last->kind == IR_JMP)
+          vec_pop(irs);
+        cur = p;
+        after = p->next;
+        at = bb_index_of(bbcon, p);
+      } else {
+        cur = new_bb();
+        if (mode == 2) {  // on the fall edge: right after p
+          at = bb_index_of(bbcon, p) + 1;
+          after = p->next;
+          cur->next = after;
+          p->next = cur;
+          vec_insert(bbcon, at, cur);
+        } else {  // the target's: after the next block that doesn't fall through
+          int k = bb_index_of(bbcon, p) + 1;
+          for (; k < bbcon->len; ++k) {
+            BB *b = bbcon->data[k - 1];
+            IR *bl = b->irs->len > 0 ? b->irs->data[b->irs->len - 1] : NULL;
+            if (bl != NULL && (bl->kind == IR_TJMP ||
+                               (bl->kind == IR_JMP && bl->jmp.cond == COND_ANY)))
+              break;
+          }
+          if (k >= bbcon->len) {
+            free(th.known);
+            continue;
+          }
+          at = k;
+          BB *prev = bbcon->data[k - 1];
+          after = prev->next;
+          cur->next = after;
+          prev->next = cur;
+          vec_insert(bbcon, at, cur);
+          last->jmp.bb = cur;
         }
-        vec_push(cur->irs, j);
-        BB *nb = new_bb();
-        nb->next = cur->next;
-        cur->next = nb;
-        vec_insert(bbcon, ++at, nb);
-        cur = nb;
       }
+      for (int s = 0; s < th.best; ++s) {
+        BB *bb = th.best_steps[s].bb;
+        Vector *birs = bb->irs;
+        IR *blast = birs->len > 0 ? birs->data[birs->len - 1] : NULL;
+        bool term = blast != NULL && (blast->kind == IR_JMP || blast->kind == IR_TJMP);
+        int n = birs->len - (term ? 1 : 0);
+        int from = cur->irs->len;
+        for (int j = 0; j < n; ++j) {
+          vec_push(cur->irs, copy_ir(birs->data[j]));
+          ++total;
+        }
+        int how = th.best_steps[s].how;
+        IR *jcopy = NULL;
+        if (how == 2 || how == 3) {  // (its test reads its temporaries too)
+          jcopy = copy_ir(blast);
+          vec_push(cur->irs, jcopy);
+        }
+        rename_local_temps(ra, cur->irs, from, uses, defs, nvregs);
+        if (jcopy != NULL) {
+          vec_pop(cur->irs);
+          if (how == 3) {
+            jcopy->jmp.cond = invert_cond(jcopy->jmp.cond);
+            jcopy->jmp.bb = bb->next;
+          }
+          vec_push(cur->irs, jcopy);
+          BB *nb = new_bb();
+          nb->next = cur->next;
+          cur->next = nb;
+          vec_insert(bbcon, ++at, nb);
+          cur = nb;
+        }
+      }
+      vec_push(cur->irs, new_ir_jmp(th.best_dest));
+      cur->next = after;
+      free(th.known);
+      changed = true;
+      // (p's predecessors' facts may hold for the new blocks too: not kept)
+      detect_from_bbs(bbcon);
     }
-    vec_push(cur->irs, new_ir_jmp(th.best_dest));
-    cur->next = after;
-    free(th.known);
-    changed = true;
   }
   free(orig);
   free(uses);
