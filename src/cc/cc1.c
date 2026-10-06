@@ -206,6 +206,11 @@ int main(int argc, char *argv[]) {
   gen(toplevel);
   emit_code(toplevel);
 
+  if (diag_fp != NULL) {  // FPC: the warnings kept (cpp/pch.c)
+    fclose(diag_fp);
+    diag_fp = NULL;
+    fwrite(diag_buf, 1, diag_size, stderr);
+  }
   if (ofp != stdout)
     fclose(ofp);
   return 0;

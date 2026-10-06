@@ -67,19 +67,22 @@ bool parse_wopt(const char *optarg, bool value) {
 }
 
 void parse_error(enum ParseErrorLevel level, const Token *token, const char *fmt, ...) {
+  if (lex_pruned && (level != PE_WARNING || cc_flags.warn_as_error))
+    exit(EXIT_PRUNED);  // FPC
+  FILE *fp = diag_fp != NULL ? diag_fp : stderr;
   va_list ap;
   va_start(ap, fmt);
   if (fmt != NULL) {
     if (token == NULL)
       token = fetch_token();
     if (token->line != NULL) {
-      fprintf(stderr, "%s(%d): ", token->line->filename, token->line->lineno);
+      fprintf(fp, "%s(%d): ", token->line->filename, token->line->lineno);
     }
 
     if (level == PE_WARNING && !cc_flags.warn_as_error)
-      fprintf(stderr, "warning: ");
-    vfprintf(stderr, fmt, ap);
-    fprintf(stderr, "\n");
+      fprintf(fp, "warning: ");
+    vfprintf(fp, fmt, ap);
+    fprintf(fp, "\n");
   }
 
   if (token != NULL && token->line != NULL && token->begin != NULL)
@@ -259,19 +262,22 @@ bool check_cast(const Type *dst, const Type *src, bool zero, bool is_explicit, c
   if (!ok || dst->kind == TY_ARRAY) {
     if (token == NULL)
       token = fetch_token();
-    fprintf(stderr, "%s(%d): ", token->line->filename, token->line->lineno);
 
     enum ParseErrorLevel level = PE_WARNING;
     if (dst->kind == TY_ARRAY || !is_prim_type(dst) ||
         !(is_prim_type(src) || (src->kind == TY_ARRAY && dst->kind == TY_PTR)))
       level = PE_NOFATAL;
-    else if (!cc_flags.warn_as_error)
-      fprintf(stderr, "warning: ");
-    fprintf(stderr, "convert value from type `");
-    print_type(stderr, src);
-    fprintf(stderr, "' to %s`", dst->kind == TY_ARRAY ? "array type " : "");
-    print_type(stderr, dst);
-    fprintf(stderr, "'\n");
+    if (lex_pruned && (level != PE_WARNING || cc_flags.warn_as_error))
+      exit(EXIT_PRUNED);  // FPC
+    FILE *fp = diag_fp != NULL ? diag_fp : stderr;
+    fprintf(fp, "%s(%d): ", token->line->filename, token->line->lineno);
+    if (level == PE_WARNING && !cc_flags.warn_as_error)
+      fprintf(fp, "warning: ");
+    fprintf(fp, "convert value from type `");
+    print_type(fp, src);
+    fprintf(fp, "' to %s`", dst->kind == TY_ARRAY ? "array type " : "");
+    print_type(fp, dst);
+    fprintf(fp, "'\n");
     parse_error(level, token, NULL);
     return false;
   }

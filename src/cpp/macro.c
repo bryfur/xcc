@@ -7,6 +7,7 @@
 #include <stdlib.h>  // malloc
 #include <string.h>
 
+#include "pch.h"  // FPC
 #include "pp_parser.h"  // pp_parse_error
 #include "table.h"
 #include "util.h"
@@ -408,7 +409,18 @@ void macro_add(const Name *name, Macro *macro) {
 }
 
 Macro *macro_get(const Name *name) {
-  return table_get(&macro_table, name);
+  Macro *macro = table_get(&macro_table, name);
+  if (macro != NULL && macro->lazy != NULL)  // FPC
+    pch_materialize(macro);
+  return macro;
+}
+
+int macro_iterate(int iterator, const Name **name, Macro **macro) {  // FPC
+  return table_iterate(&macro_table, iterator, name, (void**)macro);
+}
+
+void macro_clear(void) {  // FPC
+  table_init(&macro_table);
 }
 
 void macro_delete(const Name *name) {

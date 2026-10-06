@@ -125,8 +125,11 @@ static const char kPunctMap[] = {  // enum TokenKind
 
 Lexer lexer;
 static Table reserved_word_table;
+bool lex_pruned;  // FPC: the input says "# pruned" (cpp/pch.c)
 
 void lex_error(const char *p, const char *fmt, ...) {
+  if (lex_pruned)
+    exit(EXIT_PRUNED);  // FPC: for the driver to try again without pruning
   fprintf(stderr, "%s(%d): ", lexer.filename, lexer.lineno);
 
   va_list ap;
@@ -309,6 +312,11 @@ static bool read_next_line(void) {
 
     if (line[0] != '#')
       break;
+    if (strcmp(line, "# pruned") == 0) {  // FPC: cpp left out declarations
+      lex_pruned = true;
+      diag_fp = open_memstream(&diag_buf, &diag_size);  // Warnings: shown if it works
+      continue;
+    }
 
     // linemarkers: # linenum filename flags
     long num = -1;

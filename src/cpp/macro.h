@@ -9,6 +9,7 @@ typedef struct Macro {
   int params_len;  // -1 => no param macro
   const Name *vaargs_ident;
   Vector *body;  // <Token*>
+  const char *lazy;  // FPC: from a precompiled prefix, made at its first use (pch.c)
 } Macro;
 
 Macro *new_macro(Vector *params, const Name *vaargs_ident, Vector *body);
@@ -21,3 +22,5 @@ Macro *macro_get(const Name *name);
 void macro_reset_hidesets(void);  // FPC
 void macro_delete(const Name *name);
 void macro_expand(Vector *tokens);
+int macro_iterate(int iterator, const Name **name, Macro **macro);  // FPC: -1 => end
+void macro_clear(void);  // FPC

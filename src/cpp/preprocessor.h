@@ -14,6 +14,7 @@ enum IncludeOrder {
 void init_preprocessor(FILE *ofp);
 void set_preserve_comment(bool enable);
 void preprocess(FILE *fp, const char *filename);
+void preprocess_main(FILE *fp, const char *filename);  // FPC: with a precompiled prefix (pch.c)
 
 char *find_include_file(const char **pp, Stream *stream, bool is_next);
 

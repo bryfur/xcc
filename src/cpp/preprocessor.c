@@ -12,6 +12,7 @@
 
 #include "lexer.h"
 #include "macro.h"
+#include "pch.h"  // FPC
 #include "pp_parser.h"
 #include "table.h"
 #include "util.h"
@@ -45,6 +46,14 @@ typedef struct PreprocessFile {
 } PreprocessFile;
 
 static PreprocessFile *curpf;
+
+// FPC: the precompiled prefix of the main file (pch.c)
+static PreprocessFile *pch_mainpf;
+static int pch_skip_lines;       // In the cache: the lines not read again
+static int pch_snap_lines = -1;  // Not: the state taken after these lines
+static char *pch_prefix_buf, *pch_body_buf;
+static size_t pch_prefix_size, pch_body_size;
+static FILE *pch_body_fp;
 
 #define OUTPUT_PPLINE(...)  do { fprintf(pp_ofp, __VA_ARGS__); ++curpf->out_lineno; } while (0)
 #define OUTPUT_COMMENT(...)  do { if (preserve_comment) OUTPUT_PPLINE(__VA_ARGS__); } while (0)
@@ -421,6 +430,8 @@ static void handle_include(const char *p, Stream *stream, bool is_next) {
     error("Cannot open file: %.*s", (int)(p - orgp), orgp);
     // unreachable.
   }
+  if (pch_snap_lines >= 0)  // FPC
+    pch_add_dep(fn);
 
   preprocess(fp, fn);
   fclose(fp);
@@ -885,9 +896,26 @@ static void adjust_output_lineno(PreprocessFile *ppf) {
   }
 }
 
+// FPC: the output of the rest of the main file kept apart
+static void pch_body_start(PreprocessFile *ppf) {
+  fflush(pp_ofp);
+  pch_body_fp = open_memstream(&pch_body_buf, &pch_body_size);
+  if (pch_body_fp == NULL)
+    error("open_memstream failed");
+  pp_ofp = pch_body_fp;
+  fprintf(pp_ofp, "# %d \"%s\"\n", ppf->stream.lineno + 1, ppf->stream.filename);
+  ppf->out_lineno = ppf->stream.lineno;
+}
+
 const char *get_processed_next_line(void) {
   PreprocessFile *ppf = curpf;
   for (;;) {
+    if (ppf == pch_mainpf && pch_snap_lines >= 0 && ppf->stream.lineno >= pch_snap_lines) {
+      pch_snap_lines = -1;  // FPC: the prefix's end
+      fflush(pp_ofp);
+      pch_snapshot(pch_prefix_buf, pch_prefix_size);
+      pch_body_start(ppf);
+    }
     char *line = NULL;
     size_t capa = 0;
     ssize_t len = getline_cont(&line, &capa, ppf->stream.fp, &ppf->stream.lineno);
@@ -979,6 +1007,20 @@ void preprocess(FILE *fp, const char *filename) {
 
   fprintf(pp_ofp, "# 1 \"%s\" 1\n", filename);
 
+  if (oldpf == NULL && (pch_skip_lines > 0 || pch_snap_lines >= 0)) {  // FPC
+    pch_mainpf = &pf;
+    if (pch_skip_lines > 0) {  // The prefix restored: not read again
+      char *line = NULL;
+      size_t capa = 0;
+      while (pf.stream.lineno < pch_skip_lines &&
+             getline_cont(&line, &capa, fp, &pf.stream.lineno) != -1)
+        ;
+      free(line);
+      pch_skip_lines = 0;
+      pch_body_start(&pf);
+    }
+  }
+
   for (const char *line; (line = get_processed_next_line()) != NULL;) {
     process_line(line, &pf.stream);
     adjust_output_lineno(&pf);
@@ -1014,4 +1056,58 @@ void undef_macro(const char *begin, const char *end) {
 void add_inc_path(enum IncludeOrder order, const char *path) {
   assert(order < INC_ORDERS);
   vec_push(&sys_inc_paths[order], strdup(path));
+}
+
+// FPC: the main file, its prefix from the cache if it can be (pch.c)
+void preprocess_main(FILE *fp, const char *filename) {
+  bool hit;
+  int prefix = pch_begin(filename, &hit);
+  if (prefix <= 0) {
+    preprocess(fp, filename);
+    return;
+  }
+  FILE *ofp = pp_ofp;
+  FILE *pfp = open_memstream(&pch_prefix_buf, &pch_prefix_size);
+  if (pfp == NULL)
+    error("open_memstream failed");
+  pp_ofp = pfp;
+  if (hit)
+    pch_skip_lines = prefix;
+  else
+    pch_snap_lines = prefix;
+  preprocess(fp, filename);
+  fflush(pfp);
+  if (pch_body_fp != NULL)
+    fflush(pch_body_fp);
+  pp_ofp = ofp;
+  pch_end(ofp, pch_prefix_buf, pch_prefix_size, pch_body_fp != NULL ? pch_body_buf : "",
+          pch_body_fp != NULL ? pch_body_size : 0);
+  fclose(pfp);
+  if (pch_body_fp != NULL)
+    fclose(pch_body_fp);
+  pch_body_fp = NULL;
+  pch_mainpf = NULL;
+  pch_snap_lines = -1;
+}
+
+// FPC: what pch.c saves and restores
+Vector *pp_pragma_once_files(void) {
+  return &pragma_once_files;
+}
+
+Vector *pp_guarded_files(void) {
+  return &guarded_files;
+}
+
+Vector *pp_inc_paths(int order) {
+  return &sys_inc_paths[order];
+}
+
+void pp_add_pragma_once(const char *filename) {
+  vec_push(&pragma_once_files, filename);
+}
+
+void pp_add_guard(const char *filename, const char *name, size_t len) {
+  vec_push(&guarded_files, filename);
+  vec_push(&guarded_files, alloc_name(name, name + len, false));
 }

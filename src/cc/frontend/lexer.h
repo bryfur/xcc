@@ -20,6 +20,11 @@ typedef struct {
   int lineno;
 } Lexer;
 
+// FPC: cpp left out declarations (cpp/pch.c): the first error exits with
+// EXIT_PRUNED, for the driver to try again with all of them
+#define EXIT_PRUNED  3
+extern bool lex_pruned;
+
 void init_lexer(void);
 void init_lexer_for_preprocessor(void);
 void set_source_file(FILE *fp, const char *filename);

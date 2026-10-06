@@ -48,6 +48,9 @@ void show_version(const char *exe, int arch);
 _Noreturn void error(const char *fmt, ...);
 
 void show_error_line(const char *line, const char *p, int len);
+extern FILE *diag_fp;  // FPC: NULL: stderr
+extern char *diag_buf;
+extern size_t diag_size;
 
 bool is_im8(int64_t x);
 bool is_im16(int64_t x);
