@@ -278,6 +278,25 @@ static void register_pragma_once(const char *filename) {
 }
 
 // Search include file from system include paths.
+// FPC: whether a file is there, asked once a path (a stat of NuttX's FAT
+// costs: 530 of them for <stdio.h>, half failing, every include of every
+// header looked up again)
+static bool cached_is_file(const char *fn) {
+  static Table cache;
+  static bool init;
+  if (!init) {
+    table_init(&cache);
+    init = true;
+  }
+  const Name *key = alloc_name(fn, NULL, true);
+  void *v;
+  if (table_try_get(&cache, key, &v))
+    return v == (void*)1;
+  bool r = is_file(fn);
+  table_put(&cache, key, (void*)(intptr_t)(r ? 1 : 2));
+  return r;
+}
+
 static char *search_sysinc(const char *prevdir, const char *path) {
   for (int ord = 0; ord < INC_ORDERS; ++ord) {
     Vector *v = &sys_inc_paths[ord];
@@ -289,7 +308,7 @@ static char *search_sysinc(const char *prevdir, const char *path) {
       }
 
       char *fn = cat_path_cwd(v->data[idx], path);
-      if (is_file(fn))
+      if (cached_is_file(fn))
         return fn;
     }
   }
@@ -358,7 +377,7 @@ char *find_include_file(const char **pp, Stream *stream, bool is_next) {
   // Search from current directory.
   if (!is_next && !sys) {
     fn = cat_path_cwd(dir, path);
-    if (!is_file(fn))
+    if (!cached_is_file(fn))
       fn = NULL;
   }
   if (fn == NULL)
