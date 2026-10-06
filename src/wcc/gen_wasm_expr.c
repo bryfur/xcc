@@ -28,51 +28,120 @@ unsigned char get_func_ret_wtype(const Type *rettype) {
   return is_prim_type(rettype) ? to_wtype(rettype) : WT_VOID;
 }
 
-void gen_load(const Type *type) {
+// FPC: an address as a dynamic part on the stack and a constant part that
+// the load or store takes as its memarg offset (p->next: no i32.add): p + c
+// (c >= 0, already scaled), a struct's or array's member, an array element
+// that is an array.  A wasm address is the dynamic part plus the offset
+// without wrapping: the same for any valid C address.  (A global's address
+// in the offset, relocated, measured no faster in WAMR's JIT: not done.)
+typedef struct {
+  uint32_t ofs;
+} MemOfs;
+
+#define MEMOFS_MAX  0x10000000
+
+static void gen_ptr_ofs(Expr *expr, MemOfs *mo) {
+  for (;;) {
+    if (expr->kind == EX_ADD && ptr_or_array(expr->type) && ptr_or_array(expr->bop.lhs->type) &&
+        expr->bop.rhs->kind == EX_FIXNUM && expr->bop.rhs->fixnum >= 0 &&
+        expr->bop.rhs->fixnum < MEMOFS_MAX && mo->ofs < MEMOFS_MAX) {
+      mo->ofs += expr->bop.rhs->fixnum;
+      expr = expr->bop.lhs;
+      continue;
+    }
+    if (expr->kind == EX_MEMBER && (expr->type->kind == TY_STRUCT || expr->type->kind == TY_ARRAY) &&
+        mo->ofs < MEMOFS_MAX && expr->member.info->offset < MEMOFS_MAX) {
+      mo->ofs += expr->member.info->offset;
+      expr = expr->member.target;
+      continue;
+    }
+    if (expr->kind == EX_DEREF && (expr->type->kind == TY_STRUCT || expr->type->kind == TY_ARRAY)) {
+      expr = expr->unary.sub;
+      continue;
+    }
+    break;
+  }
+  gen_expr(expr, true);
+}
+
+// An lvalue's address so (gen_ptr_ofs)
+static void gen_lval_ofs(Expr *expr, MemOfs *mo) {
+  switch (expr->kind) {
+  case EX_DEREF:
+    gen_ptr_ofs(expr->unary.sub, mo);
+    break;
+  case EX_MEMBER:
+    if (expr->member.info->offset < MEMOFS_MAX) {
+      mo->ofs += expr->member.info->offset;
+      gen_ptr_ofs(expr->member.target, mo);
+      break;
+    }
+    // Fallthrough
+  default:
+    gen_lval(expr);
+    break;
+  }
+}
+
+static void add_memarg_ofs(const MemOfs *mo) {
+  ADD_ULEB128(mo != NULL ? mo->ofs : 0);
+}
+
+static void gen_load_ofs(const Type *type, const MemOfs *mo) {
   switch (type->kind) {
   case TY_FIXNUM:
   case TY_PTR:
     {
       bool u = is_unsigned(type);
       switch (type_size(type)) {
-      case 1:  ADD_CODE(u ? OP_I32_LOAD8_U : OP_I32_LOAD8_S, 0, 0); break;
-      case 2:  ADD_CODE(u ? OP_I32_LOAD16_U : OP_I32_LOAD16_S, 1, 0); break;
-      case 4:  ADD_CODE(OP_I32_LOAD, 2, 0); break;
-      case 8:  ADD_CODE(OP_I64_LOAD, 3, 0); break;
+      case 1:  ADD_CODE(u ? OP_I32_LOAD8_U : OP_I32_LOAD8_S, 0); break;
+      case 2:  ADD_CODE(u ? OP_I32_LOAD16_U : OP_I32_LOAD16_S, 1); break;
+      case 4:  ADD_CODE(OP_I32_LOAD, 2); break;
+      case 8:  ADD_CODE(OP_I64_LOAD, 3); break;
       default: assert(false);
       }
     }
     break;
   case TY_FLONUM:
     if (type->flonum.kind < FL_DOUBLE)
-      ADD_CODE(OP_F32_LOAD, 2, 0);
+      ADD_CODE(OP_F32_LOAD, 2);
     else
-      ADD_CODE(OP_F64_LOAD, 3, 0);
+      ADD_CODE(OP_F64_LOAD, 3);
     break;
   default: assert(false); break;
   }
+  add_memarg_ofs(mo);
 }
 
-void gen_store(const Type *type) {
+void gen_load(const Type *type) {
+  gen_load_ofs(type, NULL);
+}
+
+static void gen_store_ofs(const Type *type, const MemOfs *mo) {
   switch (type->kind) {
   case TY_FIXNUM:
   case TY_PTR:
     switch (type_size(type)) {
-    case 1:  ADD_CODE(OP_I32_STORE8, 0, 0); break;
-    case 2:  ADD_CODE(OP_I32_STORE16, 1, 0); break;
-    case 4:  ADD_CODE(OP_I32_STORE, 2, 0); break;
-    case 8:  ADD_CODE(OP_I64_STORE, 3, 0); break;
+    case 1:  ADD_CODE(OP_I32_STORE8, 0); break;
+    case 2:  ADD_CODE(OP_I32_STORE16, 1); break;
+    case 4:  ADD_CODE(OP_I32_STORE, 2); break;
+    case 8:  ADD_CODE(OP_I64_STORE, 3); break;
     default: assert(false); break;
     }
     break;
   case TY_FLONUM:
     if (type->flonum.kind < FL_DOUBLE)
-      ADD_CODE(OP_F32_STORE, 2, 0);
+      ADD_CODE(OP_F32_STORE, 2);
     else
-      ADD_CODE(OP_F64_STORE, 3, 0);
+      ADD_CODE(OP_F64_STORE, 3);
     break;
   default: assert(false); break;
   }
+  add_memarg_ofs(mo);
+}
+
+void gen_store(const Type *type) {
+  gen_store_ofs(type, NULL);
 }
 
 static void gen_arith(enum ExprKind kind, const Type *type) {
@@ -907,9 +976,12 @@ static void gen_assign_sub(Expr *lhs, Expr *rhs) {
         return;
       }
     }
-    gen_lval(lhs);
-    gen_expr(rhs, true);
-    gen_store(lhs->type);
+    {
+      MemOfs mo = {0};  // FPC
+      gen_lval_ofs(lhs, &mo);
+      gen_expr(rhs, true);
+      gen_store_ofs(lhs->type, &mo);
+    }
     break;
   case TY_STRUCT:
     {
@@ -1054,6 +1126,12 @@ static void gen_ref(Expr *expr, bool needval) {
 }
 
 static void gen_deref(Expr *expr, bool needval) {
+  if (needval && is_prim_type(expr->type)) {  // FPC: a constant part as the offset
+    MemOfs mo = {0};
+    gen_ptr_ofs(expr->unary.sub, &mo);
+    gen_load_ofs(expr->type, &mo);
+    return;
+  }
   gen_expr(expr->unary.sub, needval);
   if (needval) {
     switch (expr->type->kind) {
@@ -1076,9 +1154,13 @@ static void gen_deref(Expr *expr, bool needval) {
 
 static void gen_member(Expr *expr, bool needval) {
   if (needval) {
+    if (is_prim_type(expr->type)) {  // FPC: the member's offset as the load's
+      MemOfs mo = {0};
+      gen_lval_ofs(expr, &mo);
+      gen_load_ofs(expr->type, &mo);
+      return;
+    }
     gen_lval(expr);
-    if (is_prim_type(expr->type))
-      gen_load(expr->type);
   } else {
     gen_expr(expr->member.target, false);
   }
