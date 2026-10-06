@@ -9,7 +9,7 @@
 #include "table.h"
 #include "util.h"
 
-Type tyChar =          {.kind=TY_FIXNUM, .fixnum={.kind=FX_CHAR,  .is_unsigned=false}};
+Type tyChar =          {.kind=TY_FIXNUM, .fixnum={.kind=FX_CHAR,  .is_unsigned=PLAIN_CHAR_UNSIGNED}};
 Type tyInt =           {.kind=TY_FIXNUM, .fixnum={.kind=FX_INT,   .is_unsigned=false}};
 Type tyVoid =          {.kind=TY_VOID};
 Type tyConstVoid =     {.kind=TY_VOID, .qualifier=TQ_CONST};

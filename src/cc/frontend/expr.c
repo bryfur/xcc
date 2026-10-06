@@ -17,7 +17,7 @@
 
 Expr *string_expr(const Token *token, char *str, ssize_t len, enum StrKind kind) {
   enum FixnumKind fxkind = FX_CHAR;
-  bool is_unsigned = false;
+  bool is_unsigned = PLAIN_CHAR_UNSIGNED;
 #ifndef __NO_WCHAR
   switch (kind) {
   case STR_CHAR:  break;

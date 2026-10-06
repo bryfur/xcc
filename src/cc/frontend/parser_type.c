@@ -430,7 +430,9 @@ Type *parse_raw_type(ParsedTypeInfo *tinfo) {
       enum FixnumKind fk = (tc.char_num > 0)  ? FX_CHAR
                          : (tc.short_num > 0) ? FX_SHORT
                                               : kLongKinds[tc.long_num];
-      type = get_fixnum_type(fk, tc.unsigned_num > 0, tc.qualifier);
+      type = get_fixnum_type(fk, tc.unsigned_num > 0 ||
+                                     (PLAIN_CHAR_UNSIGNED && fk == FX_CHAR && tc.signed_num == 0),
+                             tc.qualifier);
     }
   }
 

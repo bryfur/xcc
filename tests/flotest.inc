@@ -45,7 +45,7 @@ TEST(number) {
     ITYPE i = -32; \
     expecti64("cast from " #ITYPE, -32, i); \
   }
-  TEST_CAST_FROM(char);
+  TEST_CAST_FROM(signed char);  // FPC: (plain char is unsigned on ARM)
   TEST_CAST_FROM(short);
   TEST_CAST_FROM(int);
   TEST_CAST_FROM(long);

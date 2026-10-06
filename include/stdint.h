@@ -2,7 +2,7 @@
 
 #include <stddef.h>
 
-typedef char            int8_t;
+typedef signed char     int8_t;  // FPC: (plain char is unsigned on ARM)
 typedef unsigned char   uint8_t;
 
 typedef short           int16_t;

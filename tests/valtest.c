@@ -184,7 +184,7 @@ TEST(all) {
   }
   {
     unsigned char c = 0xbd;
-    EXPECT("cast to signed", -0x43, (char)c);
+    EXPECT("cast to signed", -0x43, (signed char)c);  // FPC: (plain char is unsigned on ARM)
   }
   {
     unsigned int x = 0x80000000U;
@@ -1852,7 +1852,7 @@ TEST(bitfield) {
     ub.foo = UEV;
     EXPECT("bitfield and unsigned enum", UEV, ub.foo);
 
-    enum SignedEnum {SEV = (char)-1 << 7};
+    enum SignedEnum {SEV = (signed char)-1 << 7};
     struct SignedBitfield {enum SignedEnum foo : 8;};
     struct SignedBitfield sb;
     sb.foo = SEV;

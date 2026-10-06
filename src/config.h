@@ -140,3 +140,10 @@
 #if XCC_TARGET_PLATFORM == XCC_PLATFORM_APPLE || XCC_TARGET_PLATFORM == XCC_PLATFORM_WASI
 #define NO_DESTRUCTOR
 #endif
+
+// FPC: plain char is unsigned on ARM (the AAPCS; gcc's code, NuttX's headers)
+#if XCC_TARGET_ARCH == XCC_ARCH_ARM32
+#define PLAIN_CHAR_UNSIGNED  1
+#else
+#define PLAIN_CHAR_UNSIGNED  0
+#endif
