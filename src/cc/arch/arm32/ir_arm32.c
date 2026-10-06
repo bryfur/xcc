@@ -431,7 +431,13 @@ static int post_step(VReg *addr) {
   return c >= -255 && c <= 255 ? (int)c : 0;
 }
 
+static IR *s_skip_load;  // FPC: a load done with the one before (ldrd)
+
 static void ei_load(IR *ir) {
+  if (ir == s_skip_load) {
+    s_skip_load = NULL;
+    return;
+  }
   assert(!(ir->opr1->flag & VRF_CONST));
   bool spilled = ir->kind != IR_LOAD;
   VReg *dst = ir->dst;
@@ -470,6 +476,24 @@ static void ei_load(IR *ir) {
   if (ir == s_pre_ir) {  // FPC: pre-indexed, the step before it not emitted
     s_pre_ir = NULL;
     EMIT_ASM(op, R(dst), fmt("[%s, #%d]!", R(ir->opr1), s_pre_step));
+    return;
+  }
+  // FPC: two words from the same base, 4 bytes apart, one after the other:
+  // ldrd (the next one not emitted)
+  IR *nx = emit_next_ir;
+  if (!spilled && dst->vsize == VRegSize4 && ir->load.offset >= -1016 &&
+      ir->load.offset <= 1016 && (ir->load.offset & 3) == 0 && !ir->load.unaligned &&
+      nx != NULL && nx->kind == IR_LOAD && nx->opr1 == ir->opr1 && nx->opr2 == NULL &&
+      !nx->load.unaligned && nx->dst->vsize == VRegSize4 && !(nx->dst->flag & VRF_FLONUM) &&
+      (nx->load.offset == ir->load.offset + 4 || nx->load.offset == ir->load.offset - 4) &&
+      dst->phys != ir->opr1->phys && nx->dst->phys != dst->phys &&
+      !(nx->dst->flag & VRF_SPILLED) && !(dst->flag & VRF_SPILLED)) {
+    bool up = nx->load.offset > ir->load.offset;
+    int64_t o = up ? ir->load.offset : nx->load.offset;
+    VReg *lo = up ? dst : nx->dst, *hi = up ? nx->dst : dst;
+    EMIT_ASM("ldrd", R(lo), R(hi), o != 0 ? fmt("[%s, #%d]", R(ir->opr1), (int)o)
+                                           : fmt("[%s]", R(ir->opr1)));
+    s_skip_load = nx;
     return;
   }
   if (!spilled && ir->load.offset == 0 && !ir->load.unaligned &&

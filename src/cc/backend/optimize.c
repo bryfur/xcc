@@ -1252,6 +1252,9 @@ static bool costly_const(IR *ir, VReg *c, int which) {
            ir->kind != IR_CAST;
   }
 #if XCC_TARGET_ARCH == XCC_ARCH_ARM32
+  // (a 64-bit multiplication's constant: a pair made at each use)
+  if (c->vsize == VRegSize8 && ir->kind == IR_MUL && ir->dst != NULL)
+    return true;
   // (the first operand: an operation that takes it second too)
   if (c->vsize > VRegSize4 || (ir->dst == NULL && ir->kind != IR_JMP) ||
       (which == 1 && ir->kind != IR_ADD && ir->kind != IR_MUL && ir->kind != IR_BITAND &&
