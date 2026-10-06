@@ -3044,6 +3044,10 @@ static void print_pass_times(void) {
     if (pass_name[i] != NULL)
       fprintf(stderr, "pass %-12s %8.3f ms\n", pass_name[i], pass_time[i] * 1000);
   }
+  extern double cg_time_tweak, cg_time_flow, cg_time_regalloc;
+  fprintf(stderr, "pass %-12s %8.3f ms\npass %-12s %8.3f ms\npass %-12s %8.3f ms\n",
+          "tweak", cg_time_tweak * 1000, "regflow", cg_time_flow * 1000, "regalloc",
+          cg_time_regalloc * 1000);
 }
 
 static double pass_now(void) {

@@ -3,6 +3,7 @@
 
 #include <assert.h>
 #include <stdlib.h>  // malloc
+#include <string.h>  // memcpy
 
 #include "regalloc.h"
 #include "table.h"
@@ -460,89 +461,135 @@ void detect_from_bbs(BBContainer *bbcon) {
   } while (unchecked.len > 0);
 }
 
-static bool insert_vreg_into_vec(Vector *vregs, VReg *vreg) {
-  int lo = -1, hi = vregs->len;
-  while (hi - lo > 1) {
-    int m = lo + (hi - lo) / 2;
-    VReg *mid = vregs->data[m];
-    if      (mid->virt < vreg->virt)  lo = m;
-    else if (mid->virt > vreg->virt)  hi = m;
-    else                              return false;
-  }
-  assert(0 <= hi && hi <= vregs->len);
-  assert(hi == vregs->len || ((VReg*)vregs->data[hi])->virt != vreg->virt);
-  vec_insert(vregs, hi, vreg);
-  return true;
-}
 
-static void propagate_out_regs(VReg *vreg, Vector *froms) {
-  for (BB *bb; (bb = vec_pop(froms)) != NULL; ) {
-    insert_vreg_into_vec(bb->out_regs, vreg);
-    if (vec_contains(bb->assigned_regs, vreg) ||
-        !insert_vreg_into_vec(bb->in_regs, vreg))
-      continue;
-    vec_concat(froms, bb->from_bbs);
-  }
-}
-
+// FPC: liveness with bit sets (the sorted vectors and their searches took
+// a good part of cc1's time): in_regs live at the entry, out_regs at the
+// end, assigned_regs defined in the block, each sorted by number
 void analyze_reg_flow(BBContainer *bbcon) {
-  // Enumerate in and assigned regsiters for each BB.
-  for (int i = 0; i < bbcon->len; ++i) {
+  int nb = bbcon->len;
+  int nv = 0;
+  for (int i = 0; i < nb; ++i) {
     BB *bb = bbcon->data[i];
-    Vector *in_regs = bb->in_regs;
-    Vector *assigned_regs = bb->assigned_regs;
-    vec_clear(in_regs);
-    vec_clear(assigned_regs);
-    vec_clear(bb->out_regs);
-
-    Vector *phis = bb->phis;
-    if (phis != NULL) {
-      for (int j = 0; j < phis->len; ++j) {
-        Phi *phi = phis->data[j];
+    bb->index = i;
+    if (bb->phis != NULL) {
+      for (int j = 0; j < bb->phis->len; ++j) {
+        Phi *phi = bb->phis->data[j];
+        if (phi->dst->virt >= nv)
+          nv = phi->dst->virt + 1;
         for (int k = 0; k < phi->params->len; ++k) {
-          VReg *vreg = phi->params->data[k];
-          assert(vreg != NULL);
-          if (vreg->flag & VRF_CONST)
-            continue;
-          assert(!vec_contains(assigned_regs, vreg));
-          insert_vreg_into_vec(in_regs, vreg);
+          VReg *v = phi->params->data[k];
+          if (!(v->flag & VRF_CONST) && v->virt >= nv)
+            nv = v->virt + 1;
         }
-        insert_vreg_into_vec(assigned_regs, phi->dst);
       }
     }
-
-    Vector *irs = bb->irs;
-    for (int j = 0; j < irs->len; ++j) {
-      IR *ir = irs->data[j];
-      VReg *vregs[] = {ir->opr1, ir->opr2};
-      const int N = ARRAY_SIZE(vregs);
-      int n = N;
-      Vector *additional = ir->additional_operands;
-      if (additional != NULL)
-        n += additional->len;
-      for (int k = 0; k < n; ++k) {
-        VReg *vreg = k < N ? vregs[k] : additional->data[k - N];
-        if (vreg == NULL || vreg->flag & VRF_CONST)
-          continue;
-        if (!vec_contains(assigned_regs, vreg))
-          insert_vreg_into_vec(in_regs, vreg);
+    for (int j = 0; j < bb->irs->len; ++j) {
+      IR *ir = bb->irs->data[j];
+      VReg *vs[] = {ir->dst, ir->opr1, ir->opr2};
+      for (int k = 0; k < 3; ++k) {
+        if (vs[k] != NULL && !(vs[k]->flag & VRF_CONST) && vs[k]->virt >= nv)
+          nv = vs[k]->virt + 1;
       }
-      if (ir->dst != NULL)
-        insert_vreg_into_vec(assigned_regs, ir->dst);
+      if (ir->additional_operands != NULL) {
+        for (int k = 0; k < ir->additional_operands->len; ++k) {
+          VReg *v = ir->additional_operands->data[k];
+          if (v != NULL && !(v->flag & VRF_CONST) && v->virt >= nv)
+            nv = v->virt + 1;
+        }
+      }
     }
   }
+  int words = (nv + 31) / 32;
+  if (words == 0)
+    words = 1;
+  VReg **byvirt = calloc_or_die(sizeof(*byvirt) * (nv + 1));
+  uint32_t *use = calloc_or_die(sizeof(uint32_t) * words * nb * 4 + 4);
+  uint32_t *def = use + words * nb, *in = def + words * nb, *out = in + words * nb;
+#define BIT_SET(s, b, v)  ((s)[(b) * words + ((v) >> 5)] |= 1u << ((v) & 31))
+#define BIT_TEST(s, b, v)  (((s)[(b) * words + ((v) >> 5)] >> ((v) & 31)) & 1)
 
-  // Propagate in_regs to out_regs to from_bbs recursively.
-  Vector *dstbbs = new_vector();
-  for (int i = bbcon->len; --i >= 0; ) {
+  for (int i = 0; i < nb; ++i) {
     BB *bb = bbcon->data[i];
-    Vector *from_bbs = bb->from_bbs;
-    Vector *in_regs = bb->in_regs;
-    for (int j = 0; j < in_regs->len; ++j) {
-      assert(dstbbs->len == 0);
-      vec_concat(dstbbs, from_bbs);
-      VReg *vreg = in_regs->data[j];
-      propagate_out_regs(vreg, dstbbs);
+    if (bb->phis != NULL) {
+      for (int j = 0; j < bb->phis->len; ++j) {
+        Phi *phi = bb->phis->data[j];
+        for (int k = 0; k < phi->params->len; ++k) {
+          VReg *v = phi->params->data[k];
+          if (v->flag & VRF_CONST)
+            continue;
+          byvirt[v->virt] = v;
+          BIT_SET(use, i, v->virt);
+        }
+        byvirt[phi->dst->virt] = phi->dst;
+        BIT_SET(def, i, phi->dst->virt);
+      }
+    }
+    for (int j = 0; j < bb->irs->len; ++j) {
+      IR *ir = bb->irs->data[j];
+      VReg *vs[] = {ir->opr1, ir->opr2};
+      int n = 2 + (ir->additional_operands != NULL ? ir->additional_operands->len : 0);
+      for (int k = 0; k < n; ++k) {
+        VReg *v = k < 2 ? vs[k] : ir->additional_operands->data[k - 2];
+        if (v == NULL || (v->flag & VRF_CONST))
+          continue;
+        byvirt[v->virt] = v;
+        if (!BIT_TEST(def, i, v->virt))
+          BIT_SET(use, i, v->virt);
+      }
+      if (ir->dst != NULL && !(ir->dst->flag & VRF_CONST)) {
+        byvirt[ir->dst->virt] = ir->dst;
+        BIT_SET(def, i, ir->dst->virt);
+      }
     }
   }
+
+  // live_in = use | (live_out & ~def); live_out = the successors' live_in
+  // (a block's predecessors get its live_in)
+  memcpy(in, use, sizeof(uint32_t) * words * nb);
+  for (bool changed = true; changed; ) {
+    changed = false;
+    for (int i = nb; --i >= 0; ) {
+      BB *bb = bbcon->data[i];
+      uint32_t *bin = in + i * words;
+      for (int f = 0; f < bb->from_bbs->len; ++f) {
+        BB *p = bb->from_bbs->data[f];
+        int pi = p->index;
+        if (pi < 0 || pi >= nb || bbcon->data[pi] != p)
+          continue;
+        uint32_t *pout = out + pi * words, *pin = in + pi * words, *pdef = def + pi * words;
+        for (int w = 0; w < words; ++w) {
+          uint32_t add = bin[w] & ~pout[w];
+          if (add != 0) {
+            pout[w] |= add;
+            uint32_t nin = add & ~pdef[w] & ~pin[w];
+            if (nin != 0) {
+              pin[w] |= nin;
+              changed = true;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  for (int i = 0; i < nb; ++i) {
+    BB *bb = bbcon->data[i];
+    vec_clear(bb->in_regs);
+    vec_clear(bb->out_regs);
+    vec_clear(bb->assigned_regs);
+    for (int v = 0; v < nv; ++v) {
+      if (byvirt[v] == NULL)
+        continue;
+      if (BIT_TEST(in, i, v))
+        vec_push(bb->in_regs, byvirt[v]);
+      if (BIT_TEST(out, i, v))
+        vec_push(bb->out_regs, byvirt[v]);
+      if (BIT_TEST(def, i, v))
+        vec_push(bb->assigned_regs, byvirt[v]);
+    }
+  }
+#undef BIT_SET
+#undef BIT_TEST
+  free(use);
+  free(byvirt);
 }

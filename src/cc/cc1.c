@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>  // FPC
 
 #include "codegen.h"
 #include "emit_code.h"
@@ -55,6 +56,8 @@ static void usage(FILE *fp) {
 }
 
 int main(int argc, char *argv[]) {
+  struct timespec start_ts;  // FPC
+  clock_gettime(CLOCK_MONOTONIC, &start_ts);
   FILE *ofp = stdout;
   // FPC: -o FILE (the output: a driver in the same process can't take stdout)
   for (int i = 1; i + 1 < argc; ++i) {
@@ -203,8 +206,19 @@ int main(int argc, char *argv[]) {
   if (cc_flags.warn_as_error && compile_warning_count != 0)
     exit(2);
 
+  // FPC: XCC_PASS_TIME: the phases' times
+  struct timespec ts0, ts1, ts2;
+  clock_gettime(CLOCK_MONOTONIC, &ts0);
   gen(toplevel);
+  clock_gettime(CLOCK_MONOTONIC, &ts1);
   emit_code(toplevel);
+  clock_gettime(CLOCK_MONOTONIC, &ts2);
+  if (getenv("XCC_PASS_TIME") != NULL) {
+    fprintf(stderr, "cc1: parse %ld ms, gen %ld ms, emit %ld ms\n",
+            (long)((ts0.tv_sec - start_ts.tv_sec) * 1000 + (ts0.tv_nsec - start_ts.tv_nsec) / 1000000),
+            (long)((ts1.tv_sec - ts0.tv_sec) * 1000 + (ts1.tv_nsec - ts0.tv_nsec) / 1000000),
+            (long)((ts2.tv_sec - ts1.tv_sec) * 1000 + (ts2.tv_nsec - ts1.tv_nsec) / 1000000));
+  }
 
   if (diag_fp != NULL) {  // FPC: the warnings kept (cpp/pch.c)
     fclose(diag_fp);

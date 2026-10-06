@@ -6,6 +6,7 @@
 #include <stdbool.h>
 #include <stdlib.h>  // qsort
 #include <string.h>
+#include <time.h>  // FPC
 
 #include "ast.h"
 #include "be_aux.h"
@@ -1310,6 +1311,14 @@ bool gen_defun(Function *func) {
   return true;
 }
 
+// FPC: XCC_PASS_TIME: the backend's phases' times too (optimize.c prints them)
+double cg_time_tweak, cg_time_flow, cg_time_regalloc;
+static double cg_now(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
 static inline void gen_defun_after(Function *func) {
   FuncBackend *fnbe = func->extra;
   curfunc = func;
@@ -1317,13 +1326,19 @@ static inline void gen_defun_after(Function *func) {
 
   optimize(fnbe->ra, fnbe->bbcon);
 
+  double t0 = cg_now();
   prepare_register_allocation(func);
   tweak_irs(fnbe);
+  double t1 = cg_now();
   analyze_reg_flow(fnbe->bbcon);
   for (int i = 0; i < 3 && remove_dead_defs(fnbe->ra, fnbe->bbcon); ++i)  // FPC
     analyze_reg_flow(fnbe->bbcon);
+  double t2 = cg_now();
 
   alloc_physical_registers(fnbe->ra, fnbe->bbcon);
+  cg_time_tweak += t1 - t0;
+  cg_time_flow += t2 - t1;
+  cg_time_regalloc += cg_now() - t2;
   map_virtual_to_physical_registers(fnbe->ra);
   detect_living_registers(fnbe->ra, fnbe->bbcon);
 
