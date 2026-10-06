@@ -1320,6 +1320,8 @@ static inline void gen_defun_after(Function *func) {
   prepare_register_allocation(func);
   tweak_irs(fnbe);
   analyze_reg_flow(fnbe->bbcon);
+  for (int i = 0; i < 3 && remove_dead_defs(fnbe->ra, fnbe->bbcon); ++i)  // FPC
+    analyze_reg_flow(fnbe->bbcon);
 
   alloc_physical_registers(fnbe->ra, fnbe->bbcon);
   map_virtual_to_physical_registers(fnbe->ra);

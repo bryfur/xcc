@@ -833,6 +833,11 @@ static void ei_cast(IR *ir) {
   VReg *dst = ir->dst, *src = ir->opr1;
   assert(!(src->flag & VRF_CONST));
   bool df = (dst->flag & VRF_FLONUM) != 0, sf = (src->flag & VRF_FLONUM) != 0;
+  if (!df && !sf && ir->cast.fits && src->vsize <= VRegSize4) {  // mark_fitting_casts
+    if (dst->phys != src->phys)
+      EMIT_ASM("mov", R(dst), R(src));
+    return;
+  }
   if (!df && !sf) {
     cast_fix(dst, src);
     return;
@@ -1335,6 +1340,116 @@ static void fuse_indexed_access(RegAlloc *ra, BBContainer *bbcon) {
   free(uses);
 }
 
+// FPC: how many low bits of a 32-bit register value can be set (32: any,
+// or negative), from the instructions before `pos` in the block making it.
+// A narrow value is kept zero- or sign-extended in its register.
+static int vreg_known_bits(Vector *irs, int pos, VReg *v, int depth) {
+  if (v->flag & VRF_CONST) {
+    if (v->flag & VRF_FLONUM)
+      return 32;
+    int64_t x = v->fixnum;
+    if (x < 0 || x > 0xffffffffLL)
+      return 32;
+    int n = 0;
+    while (x != 0) {
+      ++n;
+      x >>= 1;
+    }
+    return n;
+  }
+  if (v->flag & VRF_FLONUM || v->vsize > VRegSize4)
+    return 32;
+  int by_type = (v->flag & VRF_UNSIGNED) && v->vsize < VRegSize4 ? 8 << v->vsize : 32;
+  if (depth <= 0 || (v->flag & (VRF_FORCEMEMORY | VRF_VOLATILEREG)))
+    return by_type;
+  int k;
+  for (k = pos - 1; k >= 0; --k) {
+    if (((IR*)irs->data[k])->dst == v)
+      break;
+  }
+  if (k < 0)
+    return by_type;
+  IR *ir = irs->data[k];
+  int a, b, r;
+  switch (ir->kind) {
+  case IR_MOV:
+    r = vreg_known_bits(irs, k, ir->opr1, depth - 1);
+    break;
+  case IR_BITAND:
+    a = vreg_known_bits(irs, k, ir->opr1, depth - 1);
+    b = vreg_known_bits(irs, k, ir->opr2, depth - 1);
+    r = a < b ? a : b;
+    break;
+  case IR_BITOR: case IR_BITXOR:
+    a = vreg_known_bits(irs, k, ir->opr1, depth - 1);
+    b = vreg_known_bits(irs, k, ir->opr2, depth - 1);
+    r = a > b ? a : b;
+    break;
+  case IR_ADD:
+    a = vreg_known_bits(irs, k, ir->opr1, depth - 1);
+    b = vreg_known_bits(irs, k, ir->opr2, depth - 1);
+    r = (a > b ? a : b) + 1;
+    break;
+  case IR_MUL:
+    r = vreg_known_bits(irs, k, ir->opr1, depth - 1) + vreg_known_bits(irs, k, ir->opr2, depth - 1);
+    break;
+  case IR_RSHIFT:
+    if (!(ir->opr2->flag & VRF_CONST) || ir->opr2->fixnum < 0 || ir->opr2->fixnum > 31)
+      return by_type;
+    a = vreg_known_bits(irs, k, ir->opr1, depth - 1);
+    if (a >= 32 && !(ir->opr1->flag & VRF_UNSIGNED && ir->opr1->vsize == VRegSize4))
+      return by_type;
+    r = a - (int)ir->opr2->fixnum;
+    if (r < 0)
+      r = 0;
+    break;
+  case IR_LSHIFT:
+    if (!(ir->opr2->flag & VRF_CONST) || ir->opr2->fixnum < 0 || ir->opr2->fixnum > 31)
+      return by_type;
+    r = vreg_known_bits(irs, k, ir->opr1, depth - 1) + (int)ir->opr2->fixnum;
+    break;
+  case IR_COND:
+    r = 1;
+    break;
+  case IR_CAST:
+    if ((ir->opr1->flag & VRF_FLONUM) || ir->opr1->vsize > VRegSize4)
+      return by_type;
+    a = vreg_known_bits(irs, k, ir->opr1, depth - 1);
+    if (v->vsize < VRegSize4) {
+      int d = 8 << v->vsize;
+      r = (v->flag & VRF_UNSIGNED) ? (a < d ? a : d) : (a < d ? a : 32);
+    } else {
+      r = a;
+    }
+    break;
+  default:
+    return by_type;
+  }
+  if (r > 32)
+    r = 32;
+  return r < by_type ? r : by_type;
+}
+
+static void mark_fitting_casts(BBContainer *bbcon) {
+  for (int i = 0; i < bbcon->len; ++i) {
+    BB *bb = bbcon->data[i];
+    Vector *irs = bb->irs;
+    for (int j = 0; j < irs->len; ++j) {
+      IR *ir = irs->data[j];
+      if (ir->kind != IR_CAST)
+        continue;
+      ir->cast.fits = false;
+      VReg *dst = ir->dst, *src = ir->opr1;
+      if ((dst->flag | src->flag) & VRF_FLONUM || dst->vsize >= VRegSize4 ||
+          src->vsize > VRegSize4 || (src->flag & VRF_CONST))
+        continue;
+      int d = 8 << dst->vsize;
+      int k = vreg_known_bits(irs, j, src, 6);
+      ir->cast.fits = (dst->flag & VRF_UNSIGNED) ? k <= d : k < d;
+    }
+  }
+}
+
 void tweak_irs(FuncBackend *fnbe) {
   BBContainer *bbcon = fnbe->bbcon;
   RegAlloc *ra = fnbe->ra;
@@ -1442,4 +1557,5 @@ void tweak_irs(FuncBackend *fnbe) {
       }
     }
   }
+  mark_fitting_casts(bbcon);  // FPC
 }

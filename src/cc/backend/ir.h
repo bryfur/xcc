@@ -178,6 +178,9 @@ typedef struct IR {
       enum ConditionKind kind;
     } cond;
     struct {
+      bool fits;  // FPC: the value fits the narrower type already (ARM32: no extension)
+    } cast;
+    struct {
       BB *bb;
       enum ConditionKind cond;
     } jmp;

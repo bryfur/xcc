@@ -754,9 +754,9 @@ static void count_vreg_uses(BBContainer *bbcon, int *uses, int *defs) {
 }
 
 static bool coalescable(VReg *t, VReg *v) {
-  const int NG = VRF_CONST | VRF_PARAM | VRF_STACK_PARAM | VRF_FORCEMEMORY | VRF_VOLATILEREG |
-                 VRF_NO_SPILL;
-  return t != v && !(t->flag & NG) && !(v->flag & NG) && t->vsize == v->vsize &&
+  // t: a temporary; v: any register variable (a parameter too)
+  const int NG = VRF_CONST | VRF_STACK_PARAM | VRF_FORCEMEMORY | VRF_VOLATILEREG | VRF_NO_SPILL;
+  return t != v && !(t->flag & (NG | VRF_PARAM)) && !(v->flag & NG) && t->vsize == v->vsize &&
          (t->flag & (VRF_MASK | VRF_UNALIGNED)) == (v->flag & (VRF_MASK | VRF_UNALIGNED));
 }
 
@@ -815,12 +815,25 @@ static void coalesce_moves(RegAlloc *ra, BBContainer *bbcon) {
         if (t == NULL || v == NULL || uses[t->virt] != 1 || defs[t->virt] != 1)
           continue;
         if (ir->kind != IR_MOV &&
-            !(ir->kind == IR_CAST && t->vsize == v->vsize &&
+            !(ir->kind == IR_CAST && t->vsize >= v->vsize && t->vsize <= VRegSize4 &&
               !((t->flag | v->flag) & VRF_FLONUM)))
           continue;
-        // Only the signedness differs (a cast): fine where it doesn't matter
+        // Only the signedness differs (a cast), or a widening cast (a narrow
+        // value is kept extended to 32 bits in its register: ARM32): fine
+        // where it doesn't matter
         bool signonly = false;
-        if (!coalescable(t, v)) {
+        if (t->vsize != v->vsize) {
+#if XCC_TARGET_ARCH == XCC_ARCH_ARM32
+          VReg tmp = *v;
+          tmp.vsize = t->vsize;
+          tmp.flag = (tmp.flag & ~VRF_MASK) | (t->flag & VRF_MASK);
+          if (!coalescable(t, &tmp) || t->vsize != VRegSize4)
+            continue;
+          signonly = true;
+#else
+          continue;
+#endif
+        } else if (!coalescable(t, v)) {
           int f = t->flag ^ v->flag;
           v->flag ^= f & VRF_UNSIGNED;
           signonly = coalescable(t, v);
@@ -838,7 +851,11 @@ static void coalesce_moves(RegAlloc *ra, BBContainer *bbcon) {
                 if (use->dst != NULL && use->dst->vsize == t->vsize)
                   break;
                 goto next_mov;
-              case IR_LOAD: case IR_STORE:
+              case IR_LOAD:
+                break;
+              case IR_STORE:  // (the value's size is the store's)
+                if (use->opr1 == t && t->vsize != v->vsize)
+                  goto next_mov;
                 break;
               default:
                 goto next_mov;
@@ -1186,6 +1203,60 @@ static void hoist_loop_invariants(RegAlloc *ra, BBContainer *bbcon) {
   }
   free(inloop);
   free(uses);
+}
+
+// FPC: dead definitions: a computation whose result no later instruction
+// reads (the initial value of a variable assigned again before any use...),
+// with the registers' flow known (analyze_reg_flow).  Returns whether it
+// removed any (the flow is to be analyzed again).
+bool remove_dead_defs(RegAlloc *ra, BBContainer *bbcon) {
+  int vreg_count = ra->vregs->len;
+  unsigned char *live = malloc_or_die(vreg_count);
+  bool changed = false;
+  for (int ibb = 0; ibb < bbcon->len; ++ibb) {
+    BB *bb = bbcon->data[ibb];
+    for (int i = 0; i < vreg_count; ++i)
+      live[i] = false;
+    for (int i = 0; i < bb->out_regs->len; ++i) {
+      VReg *vreg = bb->out_regs->data[i];
+      live[vreg->virt] = true;
+    }
+    Vector *irs = bb->irs;
+    for (int j = irs->len; --j >= 0; ) {
+      IR *ir = irs->data[j];
+      VReg *dst = ir->dst;
+      if (dst != NULL && !(dst->flag & VRF_CONST)) {
+        if (!live[dst->virt] && !(dst->flag & (VRF_FORCEMEMORY | VRF_VOLATILEREG))) {
+          bool pure;
+          switch (ir->kind) {
+          case IR_MOV: case IR_ADD: case IR_SUB: case IR_MUL: case IR_BITAND: case IR_BITOR:
+          case IR_BITXOR: case IR_LSHIFT: case IR_RSHIFT: case IR_NEG: case IR_BITNOT:
+          case IR_CAST: case IR_COND: case IR_BOFS: case IR_IOFS:
+            pure = true;
+            break;
+          default:
+            pure = false;
+            break;
+          }
+          if (pure) {
+            vec_remove_at(irs, j);
+            changed = true;
+            continue;
+          }
+        }
+        live[dst->virt] = false;
+      }
+      VReg *operands[] = {ir->opr1, ir->opr2};
+      int n = 2 + (ir->additional_operands != NULL ? ir->additional_operands->len : 0);
+      for (int k = 0; k < n; ++k) {
+        VReg *vreg = k < 2 ? operands[k] : ir->additional_operands->data[k - 2];
+        if (vreg != NULL && !(vreg->flag & VRF_CONST))
+          live[vreg->virt] = true;
+      }
+    }
+  }
+  free(live);
+  return changed;
 }
 
 //
