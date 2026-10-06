@@ -3138,19 +3138,18 @@ static void bit_simplify(RegAlloc *ra, BBContainer *bbcon) {
             !(a2->opr1->flag & VRF_CONST) && a1->opr1->vsize <= VRegSize4 &&
             a2->opr1->vsize <= VRegSize4 && plain_int_vreg(a1->opr1) && plain_int_vreg(a2->opr1) &&
             !defined_in(irs, k1 + 1, j, a1->opr1) && !defined_in(irs, k2 + 1, j, a2->opr1)) {
-          // t = a OP b (in a1's place); dst = t & m (in ir's)
-          VReg *t = a1->dst;
-          a1->kind = ir->kind;
-          a1->opr2 = a2->opr1;
+          // t = a OP b (in the later AND's place: both made by then); dst = t & m
+          IR *al = k1 > k2 ? a1 : a2, *ae = k1 > k2 ? a2 : a1;
+          int ke = k1 > k2 ? k2 : k1;
+          VReg *t = al->dst;
+          al->kind = ir->kind;
+          al->opr2 = al->opr1;
+          al->opr1 = ae->opr1;
           ir->kind = IR_BITAND;
           ir->opr1 = t;
-          ir->opr2 = a2->opr2;
-          if (k2 > k1 && defined_in(irs, k1 + 1, k2 + 1, a2->opr1)) {
-            // (b changed between: undo)  -- cannot happen: checked
-          }
-          vec_remove_at(irs, k2);
-          if (k2 < j)
-            --j;
+          ir->opr2 = ae->opr2;
+          vec_remove_at(irs, ke);
+          --j;
           continue;
         }
       }
