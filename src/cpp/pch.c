@@ -40,7 +40,7 @@
 #include "util.h"
 
 #define PCH_MAGIC    0x48435058  // "XPCH"
-#define PCH_VERSION  3
+#define PCH_VERSION  6
 #define TOKSEP       '\x01'      // Between a macro's tokens
 
 const char *pch_dir;
@@ -665,12 +665,38 @@ static int split_decls(Build *bd, const char *text, size_t size) {
 static DeclTable *load_decls(const char **pp) {
   DeclTable *dt = calloc_or_die(sizeof(*dt));
   const char *p = *pp;
+  // The names, and their hash table as made (slots: index + 1)
   dt->nnames = r_uv(&p);
-  for (uint32_t i = 0; i < dt->nnames; ++i) {
-    uint32_t n;
-    const char *s = r_str(&p, &n);
-    strmap_put(&dt->names, s, n, i);
+  const char **nm = malloc_or_die(sizeof(*nm) * (dt->nnames + 1));
+  uint32_t *nl = malloc_or_die(sizeof(*nl) * (dt->nnames + 1));
+  for (uint32_t i = 0; i < dt->nnames; ++i)
+    nm[i] = r_str(&p, &nl[i]);
+  uint32_t nslots = r_u32(&p);
+  StrMap *sm = &dt->names;
+  sm->cap = nslots;
+  sm->count = dt->nnames;
+  sm->keys = calloc_or_die(sizeof(*sm->keys) * nslots);
+  sm->lens = malloc_or_die(sizeof(*sm->lens) * nslots);
+  sm->vals = malloc_or_die(sizeof(*sm->vals) * nslots);
+  size_t w = dt->nnames < 0xffff ? sizeof(uint16_t) : sizeof(uint32_t);
+  for (uint32_t k = 0; k < nslots; ++k) {
+    uint32_t v;
+    if (w == sizeof(uint16_t)) {
+      uint16_t v16;
+      memcpy(&v16, p + w * k, sizeof(v16));
+      v = v16;
+    } else {
+      memcpy(&v, p + w * k, sizeof(v));
+    }
+    if (v != 0) {
+      sm->keys[k] = nm[v - 1];
+      sm->lens[k] = nl[v - 1];
+      sm->vals[k] = v - 1;
+    }
   }
+  p += w * nslots;
+  free(nm);
+  free(nl);
   dt->nfiles = r_uv(&p);
   dt->files = malloc_or_die((dt->nfiles + 1) * sizeof(*dt->files));
   for (uint32_t i = 0; i < dt->nfiles; ++i)
@@ -762,14 +788,58 @@ static bool write_macro(Buf *b, const Name *name, Macro *m) {
   return true;
 }
 
-static const char *skip_macro(const char *p) {
-  int32_t plen = (int32_t)r_uv(&p) - 1;
-  for (int32_t i = 0; i < plen; ++i)
-    r_str(&p, NULL);
-  r_str(&p, NULL);
-  if (r_uv(&p) != 0)
-    r_str(&p, NULL);
-  return p;
+
+// The macros of the cache file loaded: their hash table (in the head),
+// their records (in the file: read one by one, or all of them once many
+// were wanted)
+static const char *pch_mslots;
+static uint32_t pch_mnslots;
+static FILE *pch_mfp;
+static uint32_t pch_mrec_pos, pch_mrec_size;
+static char *pch_mrecs_all;
+static int pch_mreads;
+
+static const char *pch_macro_record(uint32_t off) {
+  if (pch_mrecs_all == NULL && ++pch_mreads > 24) {
+    char *all = malloc_or_die(pch_mrec_size + 1);
+    if (fseek(pch_mfp, pch_mrec_pos, SEEK_SET) == 0 &&
+        fread(all, 1, pch_mrec_size, pch_mfp) == pch_mrec_size)
+      pch_mrecs_all = all;
+    else
+      free(all);
+  }
+  if (pch_mrecs_all != NULL)
+    return pch_mrecs_all + off + sizeof(uint32_t);
+  uint32_t len;
+  if (fseek(pch_mfp, pch_mrec_pos + off, SEEK_SET) != 0 || fread(&len, 1, sizeof(len), pch_mfp) != sizeof(len) || len > pch_mrec_size)
+    error("pch: cannot read %s", cache_path);
+  char *rec = malloc_or_die(len + 1);
+  if (fread(rec, 1, len, pch_mfp) != len)
+    error("pch: cannot read %s", cache_path);
+  return rec;
+}
+
+// A macro the prefix defined, looked up by name (NULL: none)
+static Macro *pch_macro_lookup(const Name *name) {
+  if (pch_mnslots == 0)
+    return NULL;
+  for (uint32_t k = name->hash & (pch_mnslots - 1);; k = (k + 1) & (pch_mnslots - 1)) {
+    uint32_t h, off;
+    memcpy(&h, pch_mslots + sizeof(uint32_t) * 2 * k, sizeof(h));
+    memcpy(&off, pch_mslots + sizeof(uint32_t) * (2 * k + 1), sizeof(off));
+    if (off == 0)
+      return NULL;
+    if (h != name->hash)
+      continue;
+    const char *p = pch_macro_record(off - 1);
+    uint32_t len;
+    const char *s = r_str(&p, &len);
+    if (len == (uint32_t)name->bytes && memcmp(s, name->chars, len) == 0) {
+      Macro *m = calloc_or_die(sizeof(*m));
+      m->lazy = p;
+      return m;
+    }
+  }
 }
 
 void pch_materialize(Macro *m) {
@@ -844,12 +914,13 @@ int pch_begin(const char *filename, bool *phit) {
   FILE *fp = fopen(cache_path, "rb");
   if (fp == NULL)
     return prefix;
-  char hdr[12];
+  char hdr[20];
   const char *p = hdr;
-  uint32_t head_size;
+  uint32_t head_size, mrec_pos, sys_pos;
   if (fread(hdr, 1, sizeof(hdr), fp) != sizeof(hdr) || r_u32(&p) != PCH_MAGIC ||
       r_u32(&p) != PCH_VERSION || (head_size = r_u32(&p)) < sizeof(hdr) ||
-      head_size > (64u << 20)) {
+      head_size > (64u << 20) || (mrec_pos = r_u32(&p)) < head_size ||
+      (sys_pos = r_u32(&p)) < mrec_pos) {
     fclose(fp);
     return prefix;
   }
@@ -869,37 +940,66 @@ int pch_begin(const char *filename, bool *phit) {
   }
 
   stamp("head read");
-  // The files read, as they were?
-  uint32_t ndeps = r_uv(&p);
-  for (uint32_t i = 0; i < ndeps; ++i) {
-    const char *path = r_str(&p, NULL);
-    uint32_t size = r_uv(&p);
-    uint32_t mtime = r_u32(&p);
-    uint32_t sum = r_u32(&p);
-    struct stat ds;
-    if (sum == 0 && pch_trust_system)
-      continue;  // A system header: the key says which (--pch-key)
-    if (stat(path, &ds) != 0 || (uint32_t)ds.st_size != size || (uint32_t)ds.st_mtime != mtime ||
-        (sum != 0 && file_sum(path) != sum)) {
-      if (pch_stats)
-        fprintf(stderr, "pch: %s changed\n", path);
-      free(blob);
-      fclose(fp);
-      return prefix;
+  // The files read, as they were?  (The system headers only if the key
+  // doesn't say which they are: --pch-key)
+  char *sysbuf = NULL;
+  for (int pass = 0; pass < 2; ++pass) {
+    const char *q = p;
+    if (pass == 1) {
+      if (pch_trust_system)
+        break;
+      struct stat fs;
+      if (stat(cache_path, &fs) != 0 || (uint32_t)fs.st_size < sys_pos) {
+        free(blob);
+        fclose(fp);
+        return prefix;
+      }
+      size_t sz = fs.st_size - sys_pos;
+      sysbuf = malloc_or_die(sz + 1);
+      if (fseek(fp, sys_pos, SEEK_SET) != 0 || fread(sysbuf, 1, sz, fp) != sz) {
+        free(sysbuf);
+        free(blob);
+        fclose(fp);
+        return prefix;
+      }
+      q = sysbuf;
     }
+    uint32_t ndeps = r_uv(&q);
+    for (uint32_t i = 0; i < ndeps; ++i) {
+      const char *path = r_str(&q, NULL);
+      uint32_t size = r_uv(&q);
+      uint32_t mtime = r_u32(&q);
+      uint32_t sum = r_u32(&q);
+      struct stat ds;
+      if (stat(path, &ds) != 0 || (uint32_t)ds.st_size != size ||
+          (uint32_t)ds.st_mtime != mtime || (sum != 0 && file_sum(path) != sum)) {
+        if (pch_stats)
+          fprintf(stderr, "pch: %s changed\n", path);
+        free(sysbuf);
+        free(blob);
+        fclose(fp);
+        return prefix;
+      }
+    }
+    if (pass == 0)
+      p = q;
   }
+  free(sysbuf);
 
   stamp("files checked");
   // The state at the prefix's end
+  // (the macros looked up in the file's hash table when first used:
+  // nothing made of the thousands NuttX's headers define until then)
   macro_clear();
   uint32_t nmacros = r_uv(&p);
-  for (uint32_t i = 0; i < nmacros; ++i) {
-    const char *s = r_str(&p, &n);
-    Macro *m = calloc_or_die(sizeof(*m));
-    m->lazy = p;
-    macro_add(alloc_name(s, s + n, false), m);
-    p = skip_macro(p);
-  }
+  uint32_t nslots = r_u32(&p);
+  pch_mslots = p;
+  pch_mnslots = nslots;
+  pch_mfp = fp;
+  pch_mrec_pos = mrec_pos;
+  pch_mrec_size = sys_pos - mrec_pos;
+  p += sizeof(uint32_t) * 2 * nslots;
+  macro_set_fallback(pch_macro_lookup);
   uint32_t nonce = r_uv(&p);
   for (uint32_t i = 0; i < nonce; ++i)
     pp_add_pragma_once(r_str(&p, NULL));
@@ -939,34 +1039,58 @@ void pch_snapshot(const char *text, size_t size) {
     return;
   }
 
+  // The file: a head read whole (the key, the files read that are not
+  // system headers, the macros' hash table, the include guards, the
+  // declarations' names and table), then what is read only as needed: the
+  // declarations' text, the macros' records, the system headers read
   Buf b = {0};
   b_u32(&b, PCH_MAGIC);
   b_u32(&b, PCH_VERSION);
-  b_u32(&b, 0);  // The head's size, below
+  b_u32(&b, 0);  // The head's size (where the declarations' text starts)
+  b_u32(&b, 0);  // Where the macros' records start
+  b_u32(&b, 0);  // Where the system headers' list starts
   b_str(&b, key.p, key.len);
 
-  b_uv(&b, deps.len);
-  for (int i = 0; i < deps.len; ++i) {
-    const char *path = deps.data[i];
-    struct stat st;
-    if (stat(path, &st) != 0)
-      return;
-    b_cstr(&b, path);
-    b_uv(&b, st.st_size);
-    b_u32(&b, st.st_mtime);
-    b_u32(&b, is_system_path(path) ? 0 : file_sum(path));
+  Buf sysdeps = {0};
+  int nsys = 0, nlocal = 0;
+  for (int pass = 0; pass < 2; ++pass) {
+    if (pass == 0) {
+      for (int i = 0; i < deps.len; ++i)
+        nlocal += !is_system_path(deps.data[i]);
+      b_uv(&b, nlocal);
+    }
+    for (int i = 0; i < deps.len; ++i) {
+      const char *path = deps.data[i];
+      bool sys = is_system_path(path);
+      if (sys != (pass == 1))
+        continue;
+      struct stat st;
+      if (stat(path, &st) != 0)
+        return;
+      Buf *o = sys ? &sysdeps : &b;
+      b_cstr(o, path);
+      b_uv(o, st.st_size);
+      b_u32(o, st.st_mtime);
+      b_u32(o, sys ? 0 : file_sum(path));
+      nsys += sys;
+    }
   }
 
+  // The macros' records, then a hash table of their names (FNV-1a, as a
+  // Name's hash): the offsets of the records in the records
   const Name *name;
   Macro *m;
   uint32_t nmacros = 0;
   Buf mb = {0};
+  Vector moffs;
+  vec_init(&moffs);
   for (int it = 0; (it = macro_iterate(it, &name, &m)) != -1; ) {
     if (m == NULL || (name->bytes == 8 && (memcmp(name->chars, "__FILE__", 8) == 0 ||
                                            memcmp(name->chars, "__LINE__", 8) == 0)))
       continue;
     if (m->lazy != NULL)
       pch_materialize(m);
+    vec_push(&moffs, INT2VOIDP(mb.len));
     if (!write_macro(&mb, name, m)) {
       if (pch_stats)
         fprintf(stderr, "pch: macro %.*s not kept\n", NAMES(name));
@@ -974,8 +1098,33 @@ void pch_snapshot(const char *text, size_t size) {
     }
     ++nmacros;
   }
+  // (records in the tail, each after its length; the table in the head:
+  // per slot the name's hash and the record's offset + 1)
+  Buf recs = {0};
+  uint32_t nslots = 16;
+  while (nslots * 2 < nmacros * 3)
+    nslots *= 2;
+  uint32_t *slots = calloc_or_die(sizeof(uint32_t) * 2 * nslots);
+  for (uint32_t i = 0; i < nmacros; ++i) {
+    uint32_t off = VOIDP2INT(moffs.data[i]);
+    uint32_t end = i + 1 < nmacros ? VOIDP2INT(moffs.data[i + 1]) : mb.len;
+    const char *q = mb.p + off;
+    uint32_t len;
+    const char *s = r_str(&q, &len);
+    uint32_t h = fnv32(s, len, 2166136261u);
+    uint32_t k = h & (nslots - 1);
+    while (slots[2 * k + 1] != 0)
+      k = (k + 1) & (nslots - 1);
+    slots[2 * k] = h;
+    slots[2 * k + 1] = recs.len + 1;
+    b_u32(&recs, end - off);
+    b_put(&recs, mb.p + off, end - off);
+  }
   b_uv(&b, nmacros);
-  b_put(&b, mb.p, mb.len);
+  b_u32(&b, nslots);
+  b_put(&b, slots, sizeof(uint32_t) * 2 * nslots);
+  free(slots);
+  vec_release(&moffs);
   free(mb.p);
 
   Vector *once = pp_pragma_once_files();
@@ -993,13 +1142,47 @@ void pch_snapshot(const char *text, size_t size) {
   size_t decls_at = b.len;
   b_uv(&b, bd.nnames);
   b_put(&b, bd.name_strs.p, bd.name_strs.len);
+  {
+    // The names' hash table (strmap's: power-of-2 slots, FNV-1a, linear;
+    // per slot the index + 1, in 16 bits when they fit)
+    uint32_t nslots = 256;
+    while (nslots < (uint32_t)bd.nnames * 2 + 2)
+      nslots *= 2;
+    uint32_t *slots = calloc_or_die(sizeof(uint32_t) * nslots);
+    const char *q = bd.name_strs.p;
+    for (int i = 0; i < bd.nnames; ++i) {
+      uint32_t len;
+      const char *s = r_str(&q, &len);
+      uint32_t k = fnv32(s, len, 2166136261u) & (nslots - 1);
+      while (slots[k] != 0)
+        k = (k + 1) & (nslots - 1);
+      slots[k] = i + 1;
+    }
+    b_u32(&b, nslots);
+    for (uint32_t k = 0; k < nslots; ++k) {
+      if (bd.nnames < 0xffff) {
+        uint16_t s16 = slots[k];
+        b_put(&b, &s16, sizeof(s16));
+      } else {
+        b_u32(&b, slots[k]);
+      }
+    }
+    free(slots);
+  }
   b_uv(&b, bd.nfiles);
   b_put(&b, bd.file_strs.p, bd.file_strs.len);
   b_uv(&b, bd.ndecls);
   b_uv(&b, bd.decls.len);  // At least the number of defs and uses
   b_put(&b, bd.decls.p, bd.decls.len);
   uint32_t head_size = b.len;
+  uint32_t mrec_pos = head_size + bd.text.len;
+  uint32_t sys_pos = mrec_pos + recs.len;
   memcpy(b.p + 8, &head_size, sizeof(head_size));
+  memcpy(b.p + 12, &mrec_pos, sizeof(mrec_pos));
+  memcpy(b.p + 16, &sys_pos, sizeof(sys_pos));
+  Buf sb = {0};
+  b_uv(&sb, nsys);
+  b_put(&sb, sysdeps.p != NULL ? sysdeps.p : "", sysdeps.len);
 
   char *tmp = malloc_or_die(strlen(cache_path) + 32);
   sprintf(tmp, "%s.%d.tmp", cache_path, (int)getpid());
@@ -1007,6 +1190,8 @@ void pch_snapshot(const char *text, size_t size) {
   if (fp != NULL) {
     bool ok = fwrite(b.p, 1, b.len, fp) == b.len;
     ok = ok && fwrite(bd.text.p, 1, bd.text.len, fp) == bd.text.len;
+    ok = ok && fwrite(recs.p, 1, recs.len, fp) == recs.len;
+    ok = ok && fwrite(sb.p, 1, sb.len, fp) == sb.len;
     ok = fclose(fp) == 0 && ok;
     remove(cache_path);
     if (!ok || rename(tmp, cache_path) != 0)
@@ -1014,6 +1199,9 @@ void pch_snapshot(const char *text, size_t size) {
   }
   free(tmp);
 
+  free(recs.p);
+  free(sysdeps.p);
+  free(sb.p);
   const char *p = b.p + decls_at;
   decl_table = load_decls(&p);
   decl_table->text = bd.text.p;

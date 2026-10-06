@@ -24,3 +24,4 @@ void macro_delete(const Name *name);
 void macro_expand(Vector *tokens);
 int macro_iterate(int iterator, const Name **name, Macro **macro);  // FPC: -1 => end
 void macro_clear(void);  // FPC
+void macro_set_fallback(Macro *(*lookup)(const Name *name));  // FPC: the precompiled prefix's

@@ -408,8 +408,23 @@ void macro_add(const Name *name, Macro *macro) {
   table_put(&macro_table, name, macro);
 }
 
+// FPC: macros not in the table yet are looked up there too (the
+// precompiled prefix's); one #undef'ed is in the table as `undefined`
+static Macro *(*macro_fallback)(const Name *name);
+static Macro undefined;
+
+void macro_set_fallback(Macro *(*lookup)(const Name *name)) {
+  macro_fallback = lookup;
+}
+
 Macro *macro_get(const Name *name) {
   Macro *macro = table_get(&macro_table, name);
+  if (macro == NULL && macro_fallback != NULL) {  // FPC
+    macro = macro_fallback(name);
+    table_put(&macro_table, name, macro != NULL ? macro : &undefined);
+  }
+  if (macro == &undefined)
+    return NULL;
   if (macro != NULL && macro->lazy != NULL)  // FPC
     pch_materialize(macro);
   return macro;
@@ -424,7 +439,10 @@ void macro_clear(void) {  // FPC
 }
 
 void macro_delete(const Name *name) {
-  table_delete(&macro_table, name);
+  if (macro_fallback != NULL)  // FPC: hides the precompiled prefix's
+    table_put(&macro_table, name, &undefined);
+  else
+    table_delete(&macro_table, name);
 }
 
 void macro_expand(Vector *tokens) {
