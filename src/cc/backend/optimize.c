@@ -1703,6 +1703,43 @@ static void hoist_loop_invariants(RegAlloc *ra, BBContainer *bbcon) {
     if (!inner)
       continue;
 
+    // A narrow counter that doesn't wrap: x = x + c in the loop (its only
+    // change), the loop going on while x < C, x = k < C before it, and
+    // C - 1 + c fitting x's type: no cast after the addition
+    {
+      BB *lb = bbcon->data[j];
+      IR *back = lb->irs->data[lb->irs->len - 1];
+      VReg *x = back->opr1;
+      if (back->kind == IR_JMP && back->jmp.bb == bbcon->data[h] &&
+          (back->jmp.cond == COND_LT || back->jmp.cond == COND_LE) && x != NULL &&
+          back->opr2 != NULL && (back->opr2->flag & VRF_CONST) && !(back->opr2->flag & VRF_FLONUM) &&
+          plain_int_vreg(x) && (x->flag & VRF_UNSIGNED) && x->vsize < VRegSize4 &&
+          x->virt < vreg_count && defs[x->virt] >= 1) {
+        int64_t lim = back->opr2->fixnum + (back->jmp.cond == COND_LE ? 1 : 0);  // x < lim
+        IR *inc = NULL;
+        int ninloop = 0;
+        for (int k = h; k <= j; ++k) {
+          Vector *irs = ((BB*)bbcon->data[k])->irs;
+          for (int m = 0; m < irs->len; ++m) {
+            IR *ir = irs->data[m];
+            if (ir->dst == x) {
+              ++ninloop;
+              inc = ir;
+            }
+          }
+        }
+        int kp = def_index(pre->irs, pre->irs->len, x);
+        IR *init = kp >= 0 ? pre->irs->data[kp] : NULL;
+        if (ninloop == 1 && inc->kind == IR_ADD && inc->opr1 == x && (inc->opr2->flag & VRF_CONST) &&
+            !(inc->opr2->flag & VRF_FLONUM) && inc->opr2->fixnum >= 1 && init != NULL &&
+            init->kind == IR_MOV && (init->opr1->flag & VRF_CONST) &&
+            !(init->opr1->flag & VRF_FLONUM) && init->opr1->fixnum >= 0 &&
+            init->opr1->fixnum < lim && lim >= 1 &&
+            lim - 1 + inc->opr2->fixnum < ((int64_t)1 << (8 << x->vsize)))
+          inc->bfx.nowrap = true;
+      }
+    }
+
     // Addresses stepped by pointers of their own
     if (cc_flags.loop_sr &&
         strength_reduce(ra, bbcon, h, j, pre, &at, inloop, uses, defs, vreg_count) > 0 &&
@@ -3007,6 +3044,130 @@ static void drop_masked_casts(RegAlloc *ra, BBContainer *bbcon) {
 #endif
 }
 
+// FPC: bit operations simplified:
+//   (a & m) OP (b & m), OP of ^ | &      ->  (a OP b) & m
+//   x & m where x has no bit m doesn't   ->  x (known bits in the block)
+//   JEQ/JNE b, 1 with b 0 or 1           ->  JNE/JEQ b, 0 (cbz/cbnz)
+static int known_width(Vector *irs, int pos, VReg *v, int depth) {
+  if (v->flag & VRF_CONST) {
+    if (v->flag & VRF_FLONUM || v->fixnum < 0 || v->fixnum > 0xffffffffLL)
+      return 64;
+    int n = 0;
+    for (int64_t x = v->fixnum; x != 0; x >>= 1)
+      ++n;
+    return n;
+  }
+  if (v->flag & (VRF_FLONUM | VRF_FORCEMEMORY | VRF_VOLATILEREG) || v->vsize > VRegSize4)
+    return 64;
+  int by_type = (v->flag & VRF_UNSIGNED) && v->vsize < VRegSize4 ? 8 << v->vsize : 64;
+  if (depth <= 0)
+    return by_type;
+  int k = def_index(irs, pos, v);
+  if (k < 0)
+    return by_type;
+  IR *ir = irs->data[k];
+  int a, b, r;
+  switch (ir->kind) {
+  case IR_MOV:
+    r = known_width(irs, k, ir->opr1, depth - 1);
+    break;
+  case IR_BITAND:
+    a = known_width(irs, k, ir->opr1, depth - 1);
+    b = known_width(irs, k, ir->opr2, depth - 1);
+    r = a < b ? a : b;
+    break;
+  case IR_BITOR: case IR_BITXOR:
+    a = known_width(irs, k, ir->opr1, depth - 1);
+    b = known_width(irs, k, ir->opr2, depth - 1);
+    r = a > b ? a : b;
+    break;
+  case IR_RSHIFT:
+    if (!(ir->opr2->flag & VRF_CONST) || ir->opr2->fixnum < 0 || ir->opr2->fixnum > 31 ||
+        !(ir->opr1->flag & VRF_UNSIGNED))
+      return by_type;
+    a = known_width(irs, k, ir->opr1, depth - 1);
+    if (a > 32)
+      return by_type;
+    r = a - (int)ir->opr2->fixnum;
+    if (r < 0)
+      r = 0;
+    break;
+  case IR_COND:
+    r = 1;
+    break;
+  default:
+    return by_type;
+  }
+  return r < by_type ? r : by_type;
+}
+
+static void bit_simplify(RegAlloc *ra, BBContainer *bbcon) {
+  int vreg_count = ra->vregs->len;
+  int *uses = calloc_or_die(sizeof(*uses) * vreg_count * 2);
+  int *defs = uses + vreg_count;
+  count_vreg_uses(bbcon, uses, defs);
+  for (int i = 0; i < bbcon->len; ++i) {
+    Vector *irs = ((BB*)bbcon->data[i])->irs;
+    for (int j = 0; j < irs->len; ++j) {
+      IR *ir = irs->data[j];
+      VReg *dst = ir->dst;
+      // (a & m) OP (b & m)
+      if ((ir->kind == IR_BITXOR || ir->kind == IR_BITOR || ir->kind == IR_BITAND) &&
+          plain_int_vreg(dst) && dst->vsize <= VRegSize4 &&
+          !(ir->opr1->flag & VRF_CONST) && !(ir->opr2->flag & VRF_CONST) &&
+          plain_int_vreg(ir->opr1) && plain_int_vreg(ir->opr2) && ir->opr1 != ir->opr2 &&
+          uses[ir->opr1->virt] == 1 && defs[ir->opr1->virt] == 1 &&
+          uses[ir->opr2->virt] == 1 && defs[ir->opr2->virt] == 1) {
+        int k1 = def_index(irs, j, ir->opr1), k2 = def_index(irs, j, ir->opr2);
+        IR *a1, *a2;
+        if (k1 >= 0 && k2 >= 0 && (a1 = irs->data[k1])->kind == IR_BITAND &&
+            (a2 = irs->data[k2])->kind == IR_BITAND && (a1->opr2->flag & VRF_CONST) &&
+            (a2->opr2->flag & VRF_CONST) && !((a1->opr2->flag | a2->opr2->flag) & VRF_FLONUM) &&
+            a1->opr2->fixnum == a2->opr2->fixnum && !(a1->opr1->flag & VRF_CONST) &&
+            !(a2->opr1->flag & VRF_CONST) && a1->opr1->vsize <= VRegSize4 &&
+            a2->opr1->vsize <= VRegSize4 && plain_int_vreg(a1->opr1) && plain_int_vreg(a2->opr1) &&
+            !defined_in(irs, k1 + 1, j, a1->opr1) && !defined_in(irs, k2 + 1, j, a2->opr1)) {
+          // t = a OP b (in a1's place); dst = t & m (in ir's)
+          VReg *t = a1->dst;
+          a1->kind = ir->kind;
+          a1->opr2 = a2->opr1;
+          ir->kind = IR_BITAND;
+          ir->opr1 = t;
+          ir->opr2 = a2->opr2;
+          if (k2 > k1 && defined_in(irs, k1 + 1, k2 + 1, a2->opr1)) {
+            // (b changed between: undo)  -- cannot happen: checked
+          }
+          vec_remove_at(irs, k2);
+          if (k2 < j)
+            --j;
+          continue;
+        }
+      }
+      // x & m, x within m
+      if (ir->kind == IR_BITAND && plain_int_vreg(dst) && (ir->opr2->flag & VRF_CONST) &&
+          !(ir->opr2->flag & VRF_FLONUM) && !(ir->opr1->flag & VRF_CONST) &&
+          ir->opr2->fixnum > 0 && ir->opr1->vsize <= dst->vsize) {
+        int64_t m = ir->opr2->fixnum;
+        int w = known_width(irs, j, ir->opr1, 6);
+        if (w < 63 && (m & (((int64_t)1 << w) - 1)) == (((int64_t)1 << w) - 1)) {
+          ir->kind = IR_MOV;
+          ir->opr2 = NULL;
+          continue;
+        }
+      }
+      // JEQ/JNE b, 1, b 0 or 1
+      if (ir->kind == IR_JMP && (ir->jmp.cond == COND_EQ || ir->jmp.cond == COND_NE) &&
+          ir->opr2 != NULL && (ir->opr2->flag & VRF_CONST) && !(ir->opr2->flag & VRF_FLONUM) &&
+          ir->opr2->fixnum == 1 && !(ir->opr1->flag & VRF_CONST) &&
+          is_bool_vreg(irs, j, ir->opr1, 4)) {
+        ir->jmp.cond = ir->jmp.cond == COND_EQ ? COND_NE : COND_EQ;
+        ir->opr2 = reg_alloc_spawn_const(ra, 0, ir->opr1->vsize, ir->opr1->flag & VRF_UNSIGNED);
+      }
+    }
+  }
+  free(uses);
+}
+
 static void cond_flow(RegAlloc *ra, BBContainer *bbcon) {
   for (int pass = 0; pass < 3; ++pass) {
     bool changed = cond_diamonds(bbcon);
@@ -3093,7 +3254,7 @@ void optimize(RegAlloc *ra, BBContainer *bbcon) {
     }
   } else {
     TIMED(0, "coalesce", coalesce_moves(ra, bbcon));  // FPC
-    TIMED(1, "masked", drop_masked_casts(ra, bbcon));  // FPC
+    TIMED(1, "masked", drop_masked_casts(ra, bbcon); bit_simplify(ra, bbcon));  // FPC
     TIMED(2, "cond_flow", cond_flow(ra, bbcon));  // FPC
     bool threaded;
     TIMED(3, "thread", threaded = thread_jumps(ra, bbcon));  // FPC
@@ -3103,6 +3264,7 @@ void optimize(RegAlloc *ra, BBContainer *bbcon) {
       remove_unnecessary_bb(bbcon);
       detect_from_bbs(bbcon);
       TIMED(4, "cond_flow2", cond_flow(ra, bbcon));
+      bit_simplify(ra, bbcon);  // (what the copies put together)
     }
     if (fold_known_jumps(ra, bbcon)) {  // FPC
       detect_from_bbs(bbcon);

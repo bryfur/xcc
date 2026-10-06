@@ -186,6 +186,7 @@ typedef struct IR {
       char sh_kind;   // FPC: ALU ops: opr2 shifted first: 'l' lsl, 'r' lsr, 'a' asr (ARM32)
       int sh_amount;
       bool sbfx;      // FPC: IR_NEG of (x & 1): sbfx dst, opr1, #0, #1 (ARM32)
+      bool nowrap;    // FPC: IR_ADD to a narrow type that fits it (a loop's counter)
     } bfx;
     struct {
       BB *bb;

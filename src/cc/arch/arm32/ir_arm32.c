@@ -1823,7 +1823,8 @@ void tweak_irs(FuncBackend *fnbe) {
       // Arithmetic under 4 bytes: done in 32 bits, then cast.
       {
         VReg *dst = ir->dst;
-        if (dst != NULL && !(dst->flag & VRF_FLONUM) && dst->vsize < VRegSize4) {
+        if (dst != NULL && !(dst->flag & VRF_FLONUM) && dst->vsize < VRegSize4 &&
+            !(ir->kind == IR_ADD && ir->bfx.nowrap)) {  // (FPC: a counter that fits)
           switch (ir->kind) {
           default: break;
           case IR_ADD: case IR_SUB: case IR_MUL: case IR_LSHIFT:
