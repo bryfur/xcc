@@ -532,7 +532,10 @@ static void ei_binop64(IR *ir, const char *op_lo, const char *op_hi) {
 
 static void ei_add(IR *ir) {
   VReg *dst = ir->dst;
-  if (dst->flag & VRF_FLONUM) {
+  if (ir->additional_operands != NULL && ir->opr2 == NULL) {  // FPC: fuse_arm_ops
+    EMIT_ASM("mla", R(dst), R((VReg*)ir->additional_operands->data[0]),
+             R((VReg*)ir->additional_operands->data[1]), R(ir->opr1));
+  } else if (dst->flag & VRF_FLONUM) {
     ei_fbinop(ir, "vadd.f32", "__aeabi_dadd");
   } else if (dst->vsize == VRegSize8) {
     ei_binop64(ir, "adds", "adc");
@@ -556,7 +559,10 @@ static void ei_add(IR *ir) {
 
 static void ei_sub(IR *ir) {
   VReg *dst = ir->dst;
-  if (dst->flag & VRF_FLONUM) {
+  if (ir->additional_operands != NULL && ir->opr2 == NULL) {  // FPC: fuse_arm_ops
+    EMIT_ASM("mls", R(dst), R((VReg*)ir->additional_operands->data[0]),
+             R((VReg*)ir->additional_operands->data[1]), R(ir->opr1));
+  } else if (dst->flag & VRF_FLONUM) {
     ei_fbinop(ir, "vsub.f32", "__aeabi_dsub");
   } else if (dst->vsize == VRegSize8) {
     ei_binop64(ir, "subs", "sbc");
@@ -658,7 +664,16 @@ static void ei_logic(IR *ir, const char *op, const char *inv_op) {
   }
 }
 
-static void ei_bitand(IR *ir) { ei_logic(ir, "and", "bic"); }
+static void ei_bitand(IR *ir) {
+  if (ir->bfx.shift != 0) {  // FPC: fuse_arm_ops
+    int w = 0;
+    for (uint64_t m = (uint64_t)ir->opr2->fixnum; m != 0; m >>= 1)
+      ++w;
+    EMIT_ASM("ubfx", R(ir->dst), R(ir->opr1), im(ir->bfx.shift), im(w));
+    return;
+  }
+  ei_logic(ir, "and", "bic");
+}
 static void ei_bitor(IR *ir) { ei_logic(ir, "orr", "orn"); }
 static void ei_bitxor(IR *ir) { ei_logic(ir, "eor", NULL); }
 
@@ -1469,6 +1484,8 @@ static int vreg_known_bits(Vector *irs, int pos, VReg *v, int depth) {
     r = a > b ? a : b;
     break;
   case IR_ADD:
+    if (ir->additional_operands != NULL)  // mla
+      return by_type;
     a = vreg_known_bits(irs, k, ir->opr1, depth - 1);
     b = vreg_known_bits(irs, k, ir->opr2, depth - 1);
     r = (a > b ? a : b) + 1;
@@ -1531,6 +1548,69 @@ static void mark_fitting_casts(BBContainer *bbcon) {
       ir->cast.fits = (dst->flag & VRF_UNSIGNED) ? k <= d : k < d;
     }
   }
+}
+
+// FPC: a multiplication added to (subtracted from) a register: mla (mls);
+// a right shift masked to its low bits: ubfx.  The multiplication or the
+// shift a temporary of the same block used only there.
+static bool reg32(VReg *v) {  // (a narrow value kept extended to 32 bits)
+  return v != NULL && !(v->flag & (VRF_CONST | VRF_FLONUM | VRF_FORCEMEMORY | VRF_VOLATILEREG)) &&
+         v->vsize <= VRegSize4;
+}
+
+static void fuse_arm_ops(RegAlloc *ra, BBContainer *bbcon) {
+  int vreg_count = ra->vregs->len;
+  int *uses = malloc_or_die(sizeof(*uses) * vreg_count * 2);
+  int *defs = uses + vreg_count;
+  count_uses_defs(ra, bbcon, uses, defs);
+  for (int i = 0; i < bbcon->len; ++i) {
+    Vector *irs = ((BB*)bbcon->data[i])->irs;
+    for (int j = 0; j < irs->len; ++j) {
+      IR *ir = irs->data[j];
+      int k;
+      if (ir->kind == IR_BITAND && ir->bfx.shift == 0 && reg32(ir->dst) && reg32(ir->opr1) && (ir->opr2->flag & VRF_CONST) && !(ir->opr2->flag & VRF_FLONUM)) {
+        VReg *t = ir->opr1;
+        int64_t m = ir->opr2->fixnum;
+        IR *sh;
+        if (m <= 0 || m > 0xffffffffLL || (m & (m + 1)) != 0 || uses[t->virt] != 1 ||
+            defs[t->virt] != 1 || (t->flag & VRF_PARAM) || (sh = def_in_bb(irs, j, t, &k)) == NULL ||
+            sh->kind != IR_RSHIFT || !reg32(sh->opr1) || !(sh->opr2->flag & VRF_CONST) ||
+            sh->opr2->fixnum < 1 || sh->opr2->fixnum > 31 || defined_between(irs, k, j, sh->opr1))
+          continue;
+        int w = 0;
+        for (int64_t x = m; x != 0; x >>= 1)
+          ++w;
+        if (sh->opr2->fixnum + w > 32)
+          continue;
+        ir->opr1 = sh->opr1;
+        ir->bfx.shift = (int)sh->opr2->fixnum;
+        vec_remove_at(irs, k);
+        --j;
+        continue;
+      }
+      if ((ir->kind == IR_ADD || ir->kind == IR_SUB) && ir->additional_operands == NULL &&
+          plain_reg(ir->dst) && ir->opr2 != NULL) {
+        for (int side = ir->kind == IR_ADD ? 0 : 1; side < 2; ++side) {
+          VReg *t = side == 0 ? ir->opr1 : ir->opr2, *x = side == 0 ? ir->opr2 : ir->opr1;
+          IR *mul;
+          if (!plain_reg(t) || !reg32(x) || uses[t->virt] != 1 || defs[t->virt] != 1 ||
+              (t->flag & VRF_PARAM) || (mul = def_in_bb(irs, j, t, &k)) == NULL ||
+              mul->kind != IR_MUL || !reg32(mul->opr1) || !reg32(mul->opr2) ||
+              defined_between(irs, k, j, mul->opr1) || defined_between(irs, k, j, mul->opr2))
+            continue;
+          ir->opr1 = x;
+          ir->opr2 = NULL;
+          ir->additional_operands = new_vector();
+          vec_push(ir->additional_operands, mul->opr1);
+          vec_push(ir->additional_operands, mul->opr2);
+          vec_remove_at(irs, k);
+          --j;
+          break;
+        }
+      }
+    }
+  }
+  free(uses);
 }
 
 void tweak_irs(FuncBackend *fnbe) {
@@ -1640,5 +1720,6 @@ void tweak_irs(FuncBackend *fnbe) {
       }
     }
   }
+  fuse_arm_ops(ra, bbcon);  // FPC
   mark_fitting_casts(bbcon);  // FPC
 }

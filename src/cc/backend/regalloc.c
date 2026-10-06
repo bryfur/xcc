@@ -556,7 +556,8 @@ static int insert_load_store_spilled_irs(RegAlloc *ra, BBContainer *bbcon) {
       }
 
       // FPC: a store's index (ARM32's indexed stores)
-      if (ir->kind == IR_STORE && ir->additional_operands != NULL) {
+      if ((ir->kind == IR_STORE || ir->kind == IR_ADD || ir->kind == IR_SUB) &&  // (ARM32: mla)
+          ir->additional_operands != NULL) {
         Vector *additional = ir->additional_operands;
         for (int k = 0; k < additional->len; ++k) {
           VReg *vreg = additional->data[k];

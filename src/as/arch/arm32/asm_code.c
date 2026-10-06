@@ -310,6 +310,19 @@ static bool asm_misc(Inst *inst, ParseInfo *parser, Code *code) {
   }
 }
 
+// Bit fields: ubfx/sbfx rd, rn, #lsb, #width
+static bool asm_bitfield(Inst *inst, ParseInfo *parser, Code *code) {
+  Operand *o = inst->opr;
+  if (o[0].type != REG || o[1].type != REG || o[2].type != IMMEDIATE || o[3].type != IMMEDIATE)
+    return asm_error(parser, "illegal operand");
+  int64_t lsb = o[2].immediate, width = o[3].immediate;
+  if (lsb < 0 || lsb > 31 || width < 1 || lsb + width > 32)
+    return asm_error(parser, "illegal bit field");
+  put32(code, (inst->op == UBFX ? 0xf3c0 : 0xf340) | o[1].reg,
+        ((lsb >> 2) << 12) | (o[0].reg << 8) | ((lsb & 3) << 6) | (width - 1));
+  return true;
+}
+
 // Loads and stores of a core register.
 static bool asm_ldst(Inst *inst, ParseInfo *parser, Code *code) {
   Operand *o = inst->opr;
@@ -719,6 +732,9 @@ void assemble_inst(Inst *inst, ParseInfo *parser, Code *code) {
     break;
   case SXTB: case SXTH: case UXTB: case UXTH: case CLZ: case RBIT:
     ok = asm_misc(inst, parser, code);
+    break;
+  case UBFX: case SBFX:
+    ok = asm_bitfield(inst, parser, code);
     break;
   case LDR: case LDRB: case LDRH: case LDRSB: case LDRSH: case STR: case STRB: case STRH:
     ok = asm_ldst(inst, parser, code);

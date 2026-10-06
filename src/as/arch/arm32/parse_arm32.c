@@ -44,7 +44,7 @@ static const OpName kOpNames[] = {
   {"umull", UMULL}, {"smull", SMULL}, {"mul", MUL, true}, {"mla", MLA}, {"mls", MLS},
   {"sdiv", SDIV}, {"udiv", UDIV},
   {"sxtb", SXTB}, {"sxth", SXTH}, {"uxtb", UXTB}, {"uxth", UXTH},
-  {"clz", CLZ}, {"rbit", RBIT},
+  {"clz", CLZ}, {"rbit", RBIT}, {"ubfx", UBFX}, {"sbfx", SBFX},
   {"cbnz", CBNZ}, {"cbz", CBZ},
   {"blx", BLX}, {"bx", BX}, {"bl", BL}, {"b", B},
   {"svc", SVC}, {"nop", NOP},

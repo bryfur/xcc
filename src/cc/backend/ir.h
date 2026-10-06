@@ -181,6 +181,9 @@ typedef struct IR {
       bool fits;  // FPC: the value fits the narrower type already (ARM32: no extension)
     } cast;
     struct {
+      int shift;  // FPC: IR_BITAND: dst = (opr1 >> shift) & opr2 (ARM32: ubfx)
+    } bfx;
+    struct {
       BB *bb;
       enum ConditionKind cond;
     } jmp;
