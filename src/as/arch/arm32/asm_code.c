@@ -504,7 +504,9 @@ static bool asm_branch(Inst *inst, ParseInfo *parser, Code *code) {
       return asm_error(parser, "register expected");
     put16(code, 0x4780 | (o[0].reg << 3));
     return true;
-  case CBZ: case CBNZ:
+  case CBZ: case CBNZ:  // (the offset, or cmp and b: ir_asm_arm32.c)
+    if (o[0].type != REG || o[1].type != DIRECT)
+      return asm_error(parser, "register and label expected");
     put16(code, (inst->op == CBZ ? 0xb100 : 0xb900) | o[0].reg);
     return true;
   case SVC:

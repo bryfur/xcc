@@ -44,6 +44,9 @@ void emit_asm4(const char *op, const char *a1, const char *a2, const char *a3, c
 void emit_align_p2(int align);
 void emit_comment(const char *comment, ...);
 void emit_comm(const char *label, size_t size, size_t align);
+const char *emit_last_line(void);  // FPC: the last instruction, still changeable (NULL: none)
+void emit_replace_last_line(const char *line);
+extern int emit_cur_bb_index;  // FPC: the block being emitted (bb->index)
 
 bool function_not_returned(FuncBackend *fnbe);
 

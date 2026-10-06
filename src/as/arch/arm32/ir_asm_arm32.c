@@ -203,6 +203,52 @@ static bool resolve_branch(IR *ir, SectionInfo *section, Table *label_table, Vec
   return true;
 }
 
+// FPC: cbz/cbnz rn, label: the 16-bit instruction when rn is r0-r7 and the
+// label 0-126 bytes ahead, else (from then on) cmp rn, #0 and beq/bne
+static void resolve_cbz(IR *ir, SectionInfo *section, Table *label_table, bool *upgraded) {
+  Inst *inst = ir->code.inst;
+  Code *code = &ir->code;
+  Value value = calc_expr(label_table, inst->opr[1].direct.expr);
+  if (value.label == NULL)
+    error("branch target expected");
+  LabelInfo *label = local_label(label_table, value.label, section);
+  if (label == NULL)
+    error("cbz to another section");
+  int rn = inst->opr[0].reg;
+  int64_t target = (int64_t)(label->address + value.offset);
+  if (code->len == 2) {
+    int64_t offset = target - (int64_t)(ir->address + 4);
+    if (rn < 8 && offset >= 0 && offset <= 126) {
+      put_hw(code->buf, (inst->op == CBZ ? 0xb100 : 0xb900) | (((offset >> 6) & 1) << 9) |
+                        (((offset >> 1) & 0x1f) << 3) | rn);
+      return;
+    }
+    code->len = rn < 8 ? 4 : 6;  // cmp and a short branch, the next pass
+    *upgraded = true;
+  }
+  int cmplen = rn < 8 ? 2 : 4;
+  if (rn < 8) {
+    put_hw(code->buf, 0x2800 | (rn << 8));  // cmp rn, #0
+  } else {
+    put_hw(code->buf, 0xf1b0 | rn);  // cmp.w rn, #0
+    put_hw(code->buf + 2, 0x0f00);
+  }
+  int cond = inst->op == CBZ ? EQ : NE;
+  unsigned char *b = code->buf + cmplen;
+  int64_t offset = target - (int64_t)(ir->address + cmplen + 4);
+  if (code->len == cmplen + 2) {
+    if (offset >= -256 && offset <= 254) {
+      put_hw(b, 0xd000 | (cond << 8) | ((offset >> 1) & 0xff));
+      return;
+    }
+    code->len = cmplen + 4;
+    *upgraded = true;
+  }
+  if (offset < -(1 << 20) || offset >= (1 << 20))
+    error("conditional branch too far");
+  encode_t3(b, cond, offset);
+}
+
 static void put_imm16(unsigned char *p, uint32_t u) {
   uint32_t hw1 = get_hw(p), hw2 = get_hw(p + 2);
   hw1 = (hw1 & 0xfbf0) | ((u >> 12) & 0xf) | (((u >> 11) & 1) << 10);
@@ -230,6 +276,10 @@ bool resolve_relative_address(Vector *sections, Table *label_table, Vector *unre
           case B: case BL:
             if (inst->opr[0].type == DIRECT)
               resolve_branch(ir, section, label_table, unresolved, start_address, &upgraded);
+            break;
+          case CBZ: case CBNZ:  // FPC
+            if (inst->opr[1].type == DIRECT)
+              resolve_cbz(ir, section, label_table, &upgraded);
             break;
           case MOVW: case MOVT:
             if (inst->opr[1].type == LABEL16) {

@@ -1115,12 +1115,70 @@ static void ei_cond(IR *ir) {
   EMIT_ASM(fmt("mov%s", inv_cond(c)), dst, im(0));
 }
 
+// FPC: the last instruction made `reg` with an operation that has an S
+// variant (not in an IT block): made to set the flags (Z as a compare with
+// 0 would)
+static bool set_flags_of_last(const char *reg) {
+  const char *line = emit_last_line();
+  if (line == NULL || line[0] != '\t')
+    return false;
+  static const char *kOps[] = {
+    "mov", "mvn", "add", "sub", "rsb", "and", "orr", "eor", "bic", "orn", "lsl", "lsr", "asr",
+  };
+  const char *p = line + 1;
+  size_t n = strcspn(p, " ");
+  size_t k;
+  for (k = 0; k < sizeof(kOps) / sizeof(*kOps); ++k) {
+    if (strlen(kOps[k]) == n && strncmp(p, kOps[k], n) == 0)
+      break;
+  }
+  if (k >= sizeof(kOps) / sizeof(*kOps) || p[n] != ' ')
+    return false;
+  const char *args = p + n + 1;
+  size_t rl = strlen(reg);
+  if (strncmp(args, reg, rl) != 0 || args[rl] != ',')
+    return false;
+  // An immediate: one the S variant encodes (a modified immediate; any
+  // shift amount, a shifted register's too)
+  if (strchr(args, ':') != NULL || strchr(args, '[') != NULL)
+    return false;
+  const char *imm = strrchr(args, '#');
+  bool shift_op = strncmp(p, "lsl", 3) == 0 || strncmp(p, "lsr", 3) == 0 || strncmp(p, "asr", 3) == 0;
+  bool shifted_reg = strstr(args, ", lsl #") != NULL || strstr(args, ", lsr #") != NULL ||
+                     strstr(args, ", asr #") != NULL;
+  if (imm != NULL && !shift_op && !shifted_reg) {
+    char *end;
+    long long v = strtoll(imm + 1, &end, 0);
+    if (!is_thumb_modimm((uint32_t)v))
+      return false;
+  }
+  char buf[256];
+  snprintf(buf, sizeof(buf), "\t%.*ss %s", (int)n, p, args);
+  emit_replace_last_line(buf);
+  return true;
+}
+
 static void ei_jmp(IR *ir) {
   const char *label = fmt_name(ir->jmp.bb->label);
   int cond = ir->jmp.cond;
   assert(cond != COND_NONE);
   if (cond == COND_ANY) {
     EMIT_ASM("b", label);
+    return;
+  }
+  VReg *o1 = ir->opr1, *o2 = ir->opr2;
+  if ((cond == COND_EQ || cond == COND_NE) && o2 != NULL && (o2->flag & VRF_CONST) &&
+      !(o2->flag & VRF_FLONUM) && o2->fixnum == 0 && !(o1->flag & (VRF_CONST | VRF_FLONUM)) &&
+      o1->vsize <= VRegSize4) {
+    // FPC: a jump back (a loop's): an instruction just before that made
+    // the register sets the flags instead of a compare
+    if (ir->jmp.bb->index >= 0 && ir->jmp.bb->index <= emit_cur_bb_index &&
+        set_flags_of_last(R(o1))) {
+      EMIT_ASM(cond == COND_EQ ? "beq" : "bne", label);
+      return;
+    }
+    // cbz/cbnz (the assembler makes it cmp and beq/bne when it can't)
+    EMIT_ASM(cond == COND_EQ ? "cbz" : "cbnz", R(o1), label);
     return;
   }
   const char *c = cmp_vregs(ir->opr1, ir->opr2, cond);

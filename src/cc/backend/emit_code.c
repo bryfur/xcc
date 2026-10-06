@@ -6,6 +6,7 @@
 #include <stdarg.h>
 #include <stdint.h>  // int64_t
 #include <stdlib.h>  // realloc
+#include <string.h>
 
 #include "ast.h"
 #include "be_aux.h"
@@ -92,35 +93,76 @@ char *mangle(char *label) {
 #endif
 }
 
+// FPC: the last instruction is kept back until the next output, for the
+// backend to change it (ARM32: an S suffix that makes a compare after it
+// unneeded)
+static char pending_line[256];
+static bool has_pending;
+int emit_cur_bb_index = -1;
+
+static void flush_pending(void) {
+  if (has_pending) {
+    fputs(pending_line, emit_fp);
+    has_pending = false;
+  }
+}
+
+static void set_pending(const char *fmt_, ...) {
+  flush_pending();
+  va_list ap;
+  va_start(ap, fmt_);
+  int n = vsnprintf(pending_line, sizeof(pending_line), fmt_, ap);
+  va_end(ap);
+  if (n < 0 || n >= (int)sizeof(pending_line)) {  // (too long to keep: out now)
+    va_start(ap, fmt_);
+    vfprintf(emit_fp, fmt_, ap);
+    va_end(ap);
+    return;
+  }
+  has_pending = true;
+}
+
+const char *emit_last_line(void) {
+  return has_pending ? pending_line : NULL;
+}
+
+void emit_replace_last_line(const char *line) {
+  assert(has_pending && strlen(line) < sizeof(pending_line));
+  strcpy(pending_line, line);
+}
+
 void emit_asm_raw(const char *str) {
+  flush_pending();
   fputs(str, emit_fp);
 }
 
 void emit_asm0(const char *op) {
-  fprintf(emit_fp, "\t%s\n", op);
+  set_pending("\t%s\n", op);
 }
 
 void emit_asm1(const char *op, const char *a1) {
-  fprintf(emit_fp, "\t%s %s\n", op, a1);
+  set_pending("\t%s %s\n", op, a1);
 }
 
 void emit_asm2(const char *op, const char *a1, const char *a2) {
-  fprintf(emit_fp, "\t%s %s, %s\n", op, a1, a2);
+  set_pending("\t%s %s, %s\n", op, a1, a2);
 }
 
 void emit_asm3(const char *op, const char *a1, const char *a2, const char *a3) {
-  fprintf(emit_fp, "\t%s %s, %s, %s\n", op, a1, a2, a3);
+  set_pending("\t%s %s, %s, %s\n", op, a1, a2, a3);
 }
 
 void emit_asm4(const char *op, const char *a1, const char *a2, const char *a3, const char *a4) {
-  fprintf(emit_fp, "\t%s %s, %s, %s, %s\n", op, a1, a2, a3, a4);
+  set_pending("\t%s %s, %s, %s, %s\n", op, a1, a2, a3, a4);
 }
 
 void emit_label(const char *label) {
+  flush_pending();
   fprintf(emit_fp, "%s:\n", label);
 }
 
 void emit_comment(const char *comment, ...) {
+  flush_pending();
   if (comment == NULL) {
     fprintf(emit_fp, "\n");
     return;
@@ -137,6 +179,7 @@ void emit_comment(const char *comment, ...) {
 void emit_align_p2(int align) {
   if (align <= 1)
     return;
+  flush_pending();
   assert(IS_POWER_OF_2(align));
   fprintf(emit_fp, "\t.p2align %d\n", most_significant_bit(align));
 }
@@ -152,6 +195,7 @@ void emit_comm(const char *label, size_t size, size_t align) {
     return;
   }
 #endif
+  flush_pending();
   fprintf(emit_fp, "\t.comm %s, %zu, %zu\n", label, size, align);
 }
 
@@ -395,8 +439,11 @@ static void ei_asm(IR *ir) {
 }
 
 void emit_bb_irs(BBContainer *bbcon) {
+  for (int i = 0; i < bbcon->len; ++i)
+    ((BB*)bbcon->data[i])->index = i;  // FPC: (backward jumps known)
   for (int i = 0; i < bbcon->len; ++i) {
     BB *bb = bbcon->data[i];
+    emit_cur_bb_index = i;
 #ifndef NDEBUG
     // Check BB connection.
     if (i < bbcon->len - 1) {
@@ -622,4 +669,5 @@ void emit_code(Vector *decls) {
 #if XCC_TARGET_PLATFORM == XCC_PLATFORM_APPLE
   _SUBSECTIONS_VIA_SYMBOLS();
 #endif
+  flush_pending();  // FPC
 }
