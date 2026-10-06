@@ -12,6 +12,11 @@ typedef struct RegAlloc RegAlloc;
 typedef struct VarInfo VarInfo;
 typedef struct Vector Vector;
 
+// FPC: register sets as bits (64: a 32-bit host has 32-bit longs, and the
+// GP and FP sets together may need more)
+typedef uint64_t RegBits;
+#define REGBIT(n)  ((RegBits)1 << (n))
+
 typedef struct FrameInfo {
   size_t size;
   int offset;
@@ -38,6 +43,7 @@ enum VRegSize {
 #define VRF_VOLATILEREG  (1 << 9)  // Volatile, but register
 #define VRF_FP_GP_PARAM  (1 << 10) // FP, but passed by GP register
 #define VRF_UNSIGNED     (1 << 11) // Unsigned
+#define VRF_UNALIGNED    (1 << 12) // FPC: a pointer into a packed struct (loads and stores through it may be unaligned)
 
 #define VRF_MASK         (VRF_FLONUM | VRF_UNSIGNED)
 #define VRF_FORCEMEMORY  (VRF_REF | VRF_SPILLED | VRF_VOLATILE)
@@ -127,7 +133,7 @@ typedef struct {
   // Precall
   size_t stack_args_size;
   int arg_count;
-  unsigned long living_pregs;
+  RegBits living_pregs;
   Vector *caller_saves;  // <const char*>
 
   // Call
@@ -159,9 +165,11 @@ typedef struct IR {
     } iofs;
     struct {
       int64_t offset;
+      bool unaligned;  // FPC: VRF_UNALIGNED address
     } load;
     struct {
       int64_t offset;
+      bool unaligned;  // FPC: VRF_UNALIGNED address
     } store;
     struct {
       enum ConditionKind kind;
@@ -176,7 +184,7 @@ typedef struct IR {
     } tjmp;
     struct {
       int index;
-#if VAARG_FP_AS_GP
+#if VAARG_FP_AS_GP || PUSHARG_FP_AS_GP
       bool fp_as_gp;
 #endif
     } pusharg;

@@ -22,6 +22,10 @@
 #include "util.h"
 #include "var.h"
 
+#if XCC_TARGET_ARCH == XCC_ARCH_ARM32
+#include "arch/arm32/aapcs.h"
+#endif
+
 static Expr *proc_builtin_classify_type(const Token *ident) {
   consume(TK_LPAR, "`(' expected");
   ParsedTypeInfo tinfo;
@@ -80,7 +84,7 @@ static Expr *proc_builtin_nan(const Token *ident) {
     parse_error(PE_NOFATAL, fmt->token, "string literal expected");
   }
 
-  const uint64_t MASK = (1UL << 52) - 1UL;
+  const uint64_t MASK = ((uint64_t)1 << 52) - 1;  // FPC: was 1UL (a 32-bit host)
   union { double d; uint64_t q; } u;
   u.d = NAN;
   u.q = (u.q & ~MASK) | (significand & MASK);
@@ -168,6 +172,53 @@ static VReg *gen_builtin_va_start(Expr *expr) {
     p = new_ir_bop(IR_ADD, p, addend, vsize);
   }
   new_ir_mov(varinfo->local.vreg, p);
+  return NULL;
+}
+#elif XCC_TARGET_ARCH == XCC_ARCH_ARM32
+// FPC: ARM32: a variadic function pushes r0-r3 on entry, just below the
+// arguments on the stack (emit_arm32.c): the variadic arguments are in
+// order in memory from where the named ones end.
+static VReg *gen_builtin_va_start(Expr *expr) {
+  assert(expr->kind == EX_FUNCALL);
+  Vector *args = expr->funcall.args;
+  assert(args->len == 2);
+  assert(curfunc != NULL);
+  Expr *var = strip_cast(args->data[1]);
+
+  const Vector *params = curfunc->params;
+  assert(params != NULL);
+  assert(params->len > 0);
+
+  bool is_last = false;
+  if (var->kind == EX_VAR) {
+    assert(curfunc->type->func.vaargs);
+    VarInfo *varinfo = params->data[params->len - 1];
+    is_last = equal_name(var->var.name, varinfo->ident->ident);
+  }
+  if (!is_last) {
+    parse_error(PE_NOFATAL, var->token, "must be last function argument");
+    return NULL;
+  }
+
+  FuncBackend *fnbe = curfunc->extra;
+  AapcsState st;
+  aapcs_init(&st, true, fnbe->struct_retvar != NULL);
+  for (int i = 0; i < params->len; ++i) {
+    VarInfo *varinfo = params->data[i];
+    aapcs_next(&st, varinfo->type);
+  }
+  int offset = st.ncrn < 4 ? st.ncrn * 4 - 16 : st.nsaa;
+
+  FrameInfo *fi = &fnbe->vaarg_frame_info;
+  VReg *p = new_ir_bofs(fi)->dst;
+  enum VRegSize vsize = to_vsize(&tyVoidPtr);
+  if (offset > 0)
+    p = new_ir_bop(IR_ADD, p, new_const_vreg(offset, vsize, VRF_UNSIGNED), vsize);
+  else if (offset < 0)
+    p = new_ir_bop(IR_SUB, p, new_const_vreg(-offset, vsize, VRF_UNSIGNED), vsize);
+
+  VReg *ap = gen_expr(args->data[0]);
+  new_ir_mov(ap, p);
   return NULL;
 }
 #elif XCC_TARGET_ARCH == XCC_ARCH_RISCV64
@@ -519,6 +570,37 @@ static void parse_builtins(Vector *decls) {
     CTZ(long long, ll)
     POPCOUNT_GENERIC
   ;
+#elif XCC_TARGET_ARCH == XCC_ARCH_ARM32
+  // FPC: ARM32: clz, rbit; the 64-bit ones on two words.
+# define CLZ32(T, postfix) \
+    "static inline int __builtin_clz" S(postfix) "(volatile register unsigned " S(T) " x) {\n" \
+    "  int result;\n" \
+    "  __asm(\"  clz %0, %1\\n\" : \"=r\"(result) : \"r\"(x));\n" \
+    "  return result;\n" \
+    "}\n"
+# define CTZ32(T, postfix) \
+    "static inline int __builtin_ctz" S(postfix) "(volatile register unsigned " S(T) " x) {\n" \
+    "  int result;\n" \
+    "  __asm(\"  rbit %0, %1\\n\"" \
+    "        \"  clz %0, %0\\n\" : \"=r\"(result) : \"r\"(x));\n" \
+    "  return result;\n" \
+    "}\n"
+
+  static const char src[] =
+    CLZ32(int, )
+    CLZ32(long, l)
+    CTZ32(int, )
+    CTZ32(long, l)
+    "static inline int __builtin_clzll(unsigned long long x) {\n"
+    "  unsigned hi = x >> 32;\n"
+    "  return hi != 0 ? __builtin_clz(hi) : 32 + __builtin_clz((unsigned)x);\n"
+    "}\n"
+    "static inline int __builtin_ctzll(unsigned long long x) {\n"
+    "  unsigned lo = x;\n"
+    "  return lo != 0 ? __builtin_ctz(lo) : 32 + __builtin_ctz((unsigned)(x >> 32));\n"
+    "}\n"
+    POPCOUNT_GENERIC
+  ;
 #elif XCC_TARGET_ARCH == XCC_ARCH_RISCV64
 
 # define CLZ(T, postfix, w) \
@@ -596,7 +678,7 @@ void install_builtins(Vector *decls) {
 #endif
 
   {
-#if VAARG_ON_STACK || XCC_TARGET_ARCH == XCC_ARCH_RISCV64
+#if VAARG_ON_STACK || XCC_TARGET_ARCH == XCC_ARCH_RISCV64 || XCC_TARGET_ARCH == XCC_ARCH_ARM32
     Type *tyVaList = ptrof(&tyVoidPtr);
 #else
     Type *tyVaElem = create_struct_type(NULL, alloc_cname("__va_elem"), 0);

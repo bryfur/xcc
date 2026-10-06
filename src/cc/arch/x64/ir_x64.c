@@ -61,7 +61,7 @@ const char *kFReg64s[PHYSICAL_FREG_MAX] = {
 #define CALLER_SAVE_FREG_COUNT  ((int)ARRAY_SIZE(kCallerSaveFRegs))
 static const int kCallerSaveFRegs[] = {8, 9, 10, 11, 12, 13, 14, 15};
 
-static unsigned long detect_extra_occupied(RegAlloc *ra, IR *ir) {
+static RegBits detect_extra_occupied(RegAlloc *ra, IR *ir) {
   unsigned long ioccupy = 0;
   switch (ir->kind) {
   case IR_MUL: case IR_DIV: case IR_MOD:
@@ -151,7 +151,7 @@ void pop_callee_save_regs(unsigned long used, unsigned long fused) {
 
 int calculate_func_param_bottom(Function *func) {
   FuncBackend *fnbe = func->extra;
-  const unsigned long *pused = fnbe->ra->used_reg_bits;
+  const RegBits *pused = fnbe->ra->used_reg_bits;
   int callee_save_count = count_callee_save_regs(pused[GPREG], pused[FPREG]);
 
   return (callee_save_count * TARGET_POINTER_SIZE) +

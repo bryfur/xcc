@@ -12,6 +12,16 @@
 
 // Register allocator
 
+// FPC: registers a vreg takes (an 8-byte value in a pair on a 32-bit target)
+int vreg_reg_width(const RegAlloc *ra, const VReg *vreg) {
+  int is_flo = (vreg->flag & VRF_FLONUM) != 0;
+  return vreg->vsize == VRegSize8 && ra->settings->regset[is_flo].pair_align > 0 ? 2 : 1;
+}
+
+static inline RegBits reg_mask(int phys, int width) {
+  return width == 2 ? REGBIT(phys) | REGBIT(phys + 1) : REGBIT(phys);
+}
+
 RegAlloc *new_reg_alloc(const RegAllocSettings *settings) {
   RegAlloc *ra = calloc_or_die(sizeof(*ra));
   assert(settings->regset[GPREG].phys_max < (int)(sizeof(ra->used_reg_bits) * CHAR_BIT));
@@ -125,40 +135,91 @@ static int sort_live_interval(const void *pa, const void *pb) {
   return d;
 }
 
-static void split_at_interval(RegAlloc *ra, LiveInterval **active, int active_count,
-                              LiveInterval *li) {
-  assert(active_count > 0);
-  LiveInterval *spill = active[active_count - 1];
-  if (spill->end > li->end) {
-    li->phys = spill->phys;
-    spill->phys = ra->settings->regset[GPREG].phys_max;
-    spill->state = LI_SPILL;
-    insert_active(active, active_count - 1, li);
-  } else {
-    li->phys = ra->settings->regset[GPREG].phys_max;
-    li->state = LI_SPILL;
-  }
-}
-
 typedef struct {
   LiveInterval **active;
   int phys_max;
   int phys_temporary;
   int active_count;
-  unsigned long using_bits;
-  unsigned long used_bits;
+  RegBits using_bits;
+  RegBits used_bits;
 } PhysicalRegisterSet;
 
-static void expire_old_intervals(PhysicalRegisterSet *p, int start) {
+// No register free for li: take one (or a pair) from active intervals,
+// spilling them, or spill li.  FPC: generalized for register pairs and for
+// intervals that must not spill (VRF_NO_SPILL: the temporaries of spill
+// code): the place whose evicted intervals live longest is chosen, if they
+// live longer than li (or li must not spill).  Returns true if li got a
+// register.
+static bool split_at_interval(RegAlloc *ra, PhysicalRegisterSet *prsp, LiveInterval *li) {
+  VReg *livreg = ra->vregs->data[li->virt];
+  bool is_flo = (livreg->flag & VRF_FLONUM) != 0;
+  int w = vreg_reg_width(ra, livreg);
+  int align = w == 2 ? ra->settings->regset[is_flo].pair_align : 1;
+  RegBits forbid = li->occupied_reg_bit | ra->settings->regset[is_flo].reserved;
+  int best = -1, best_end = -1;
+  for (int j = 0; j + w <= prsp->phys_max; ++j) {
+    if (align > 1 && (j % align) != 0)
+      continue;
+    RegBits m = reg_mask(j, w);
+    if (forbid & m)
+      continue;
+    int min_end = 1 << 30;
+    bool ok = true;
+    for (int k = 0; k < prsp->active_count; ++k) {
+      LiveInterval *a = prsp->active[k];
+      VReg *av = ra->vregs->data[a->virt];
+      if (!(reg_mask(a->phys, vreg_reg_width(ra, av)) & m))
+        continue;
+      if (av->flag & VRF_NO_SPILL) {
+        ok = false;
+        break;
+      }
+      if (a->end < min_end)
+        min_end = a->end;
+    }
+    if (ok && min_end > best_end) {
+      best = j;
+      best_end = min_end;
+    }
+  }
+
+  if (best < 0 || (!(livreg->flag & VRF_NO_SPILL) && best_end <= li->end)) {
+    li->phys = ra->settings->regset[GPREG].phys_max;
+    li->state = LI_SPILL;
+    return false;
+  }
+
+  RegBits m = reg_mask(best, w);
+  for (int k = 0; k < prsp->active_count; ) {
+    LiveInterval *a = prsp->active[k];
+    RegBits am = reg_mask(a->phys, vreg_reg_width(ra, ra->vregs->data[a->virt]));
+    if (!(am & m)) {
+      ++k;
+      continue;
+    }
+    prsp->using_bits &= ~am;
+    a->phys = ra->settings->regset[GPREG].phys_max;
+    a->state = LI_SPILL;
+    remove_active(prsp->active, prsp->active_count, k, 1);
+    --prsp->active_count;
+  }
+  li->phys = best;
+  prsp->using_bits |= m;
+  insert_active(prsp->active, prsp->active_count, li);
+  ++prsp->active_count;
+  return true;
+}
+
+static void expire_old_intervals(RegAlloc *ra, PhysicalRegisterSet *p, int start) {
   int active_count = p->active_count;
-  unsigned long using_bits = p->using_bits;
+  RegBits using_bits = p->using_bits;
   int j;
   for (j = 0; j < active_count; ++j) {
     LiveInterval *li = p->active[j];
     if (li->end > start)
       break;
     int phys = li->phys;
-    using_bits &= ~(1UL << phys);
+    using_bits &= ~reg_mask(phys, vreg_reg_width(ra, ra->vregs->data[li->virt]));
   }
   remove_active(p->active, active_count, 0, j);
   p->active_count = active_count - j;
@@ -221,7 +282,7 @@ static void check_live_interval(BBContainer *bbcon, int vreg_count, LiveInterval
   }
 }
 
-static void occupy_regs(RegAlloc *ra, Vector *actives, const unsigned long occupy[2]) {
+static void occupy_regs(RegAlloc *ra, Vector *actives, const RegBits occupy[2]) {
   for (int k = 0; k < actives->len; ++k) {
     LiveInterval *li = actives->data[k];
     VReg *vreg = ra->vregs->data[li->virt];
@@ -244,18 +305,18 @@ static void detect_live_interval_flags(RegAlloc *ra, BBContainer *bbcon, int vre
 
   const RegAllocSettings *settings = ra->settings;
   int nip = 0;
-  unsigned long argset[2] = {0, 0};  // [0]=gp-reg, [1]=fp-reg
+  RegBits argset[2] = {0, 0};  // [0]=gp-reg, [1]=fp-reg
   for (int i = 0; i < bbcon->len; ++i) {
     BB *bb = bbcon->data[i];
     for (int j = 0; j < bb->irs->len; ++j, ++nip) {
       IR *ir = bb->irs->data[j];
       if (settings->detect_extra_occupied != NULL) {
-        unsigned long occupy[2];
+        RegBits occupy[2];
         occupy[GPREG] = (*settings->detect_extra_occupied)(ra, ir);
-        if (occupy[GPREG] != 0) {
-          occupy[FPREG] = 0;
+        occupy[FPREG] = settings->detect_extra_occupied_fp != NULL
+            ? (*settings->detect_extra_occupied_fp)(ra, ir) : 0;
+        if (occupy[GPREG] != 0 || occupy[FPREG] != 0)
           occupy_regs(ra, actives, occupy);
-        }
       }
 
       if (argset[GPREG] != 0 || argset[FPREG] != 0)
@@ -275,16 +336,16 @@ static void detect_live_interval_flags(RegAlloc *ra, BBContainer *bbcon, int vre
           // Update function parameter register occupation after setting it.
           VReg *opr1 = ir->opr1;
           if (opr1->flag & VRF_FLONUM
-#if VAARG_FP_AS_GP
+#if VAARG_FP_AS_GP || PUSHARG_FP_AS_GP
               && !ir->pusharg.fp_as_gp
 #endif
           ) {
             int n = ir->pusharg.index;  // Assume same order on FP-register.
-            argset[FPREG] |= 1UL << n;
+            argset[FPREG] |= reg_mask(n, vreg_reg_width(ra, opr1));
           } else {
             int n = settings->reg_param_mapping[ir->pusharg.index];
             if (n >= 0)
-              argset[GPREG] |= 1UL << n;
+              argset[GPREG] |= reg_mask(n, (opr1->flag & VRF_FLONUM) ? 1 + (opr1->vsize == VRegSize8 && settings->regset[GPREG].pair_align > 0) : vreg_reg_width(ra, opr1));
           }
         }
         break;
@@ -293,9 +354,9 @@ static void detect_live_interval_flags(RegAlloc *ra, BBContainer *bbcon, int vre
         // Call instruction breaks registers which contain in their live interval (start < nip < end).
         {
           // Non-saved registers on calling convention.
-          unsigned long broken[2];
+          RegBits broken[2];
           for (int k = 0; k < (int)ARRAY_SIZE(broken); ++k) {
-            broken[k] = (1UL << settings->regset[k].phys_temporary_count) - 1;
+            broken[k] = REGBIT(settings->regset[k].phys_temporary_count) - 1;
             argset[k] = 0;
           }
           occupy_regs(ra, actives, broken);
@@ -309,11 +370,11 @@ static void detect_live_interval_flags(RegAlloc *ra, BBContainer *bbcon, int vre
         } else if (ir->dst == NULL) {
           if (ir->opr1->flag & VRF_FLONUM) {
             int n = ir->result.index;  // Assume same order on FP-register.
-            argset[FPREG] |= 1UL << n;
+            argset[FPREG] |= reg_mask(n, vreg_reg_width(ra, ir->opr1));
           } else {
             int n = settings->reg_return_mapping[ir->result.index];
             assert(n >= 0);
-            argset[GPREG] |= 1UL << n;
+            argset[GPREG] |= reg_mask(n, vreg_reg_width(ra, ir->opr1));
           }
         }
         break;
@@ -353,16 +414,19 @@ static void linear_scan_register_allocation(RegAlloc *ra, LiveInterval **sorted_
       continue;
     if (li->state != LI_NORMAL)
       continue;
-    expire_old_intervals(&regset[GPREG], li->start);
-    expire_old_intervals(&regset[FPREG], li->start);
+    expire_old_intervals(ra, &regset[GPREG], li->start);
+    expire_old_intervals(ra, &regset[FPREG], li->start);
 
     VReg *vreg = ra->vregs->data[li->virt];
     bool is_flo = (vreg->flag & VRF_FLONUM) != 0;
     PhysicalRegisterSet *prsp = &regset[is_flo];
+    int width = vreg_reg_width(ra, vreg);
+    int align = width == 2 ? ra->settings->regset[is_flo].pair_align : 1;
     int start_index = 0;
     int regno = -1;
     int ip = vreg->reg_param_index;
-    unsigned long occupied = prsp->using_bits | li->occupied_reg_bit;
+    RegBits occupied = prsp->using_bits | li->occupied_reg_bit |
+                       ra->settings->regset[is_flo].reserved;
     if (ip >= 0 && !(vreg->flag & VRF_FP_GP_PARAM)) {
       if (is_flo) {
         // Assume floating-pointer parameter registers are same order,
@@ -371,14 +435,16 @@ static void linear_scan_register_allocation(RegAlloc *ra, LiveInterval **sorted_
         ip = ra->settings->reg_param_mapping[ip];
       }
 
-      if (ip >= 0 && !(occupied & (1UL << ip)))
+      if (ip >= 0 && ip + width <= prsp->phys_max && !(occupied & reg_mask(ip, width)))
         regno = ip;
       else
         start_index = prsp->phys_temporary;
     }
     if (regno < 0) {
-      for (int j = start_index; j < prsp->phys_max; ++j) {
-        if (!(occupied & (1UL << j))) {
+      for (int j = start_index; j + width <= prsp->phys_max; ++j) {
+        if (align > 1 && (j % align) != 0)
+          continue;
+        if (!(occupied & reg_mask(j, width))) {
           regno = j;
           break;
         }
@@ -386,12 +452,13 @@ static void linear_scan_register_allocation(RegAlloc *ra, LiveInterval **sorted_
     }
     if (regno >= 0) {
       li->phys = regno;
-      prsp->using_bits |= 1UL << regno;
+      prsp->using_bits |= reg_mask(regno, width);
 
       insert_active(prsp->active, prsp->active_count, li);
       ++prsp->active_count;
     } else {
-      split_at_interval(ra, prsp->active, prsp->active_count, li);
+      if (!split_at_interval(ra, prsp, li))
+        ;  // li spilled.
     }
     prsp->used_bits |= prsp->using_bits;
   }

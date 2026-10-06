@@ -14,6 +14,24 @@ typedef __gnuc_va_list va_list;
 #define va_arg(ap,ty)     __builtin_va_arg(ap,ty)
 #define va_copy(dst,src)  __builtin_va_copy(dst,src)
 
+#elif defined(__arm__)
+// FPC: ARM32 (AAPCS): the variadic arguments in order in memory (a
+// variadic function pushes r0-r3 below the stacked ones), 8-byte types
+// 8-byte aligned, the rest in 4-byte slots.  One word, as the AAPCS's
+// va_list (a struct of one pointer) is when passed (vprintf...).
+typedef void **va_list;
+typedef va_list __gnuc_va_list;
+
+#define va_start(ap,p)    __builtin_va_start(ap,p)
+#define va_end(ap)        /*(void)*/(ap = 0)
+#define va_arg(ap, ty)    (*(ty *)__va_arg_next(&(ap), sizeof(ty), _Alignof(ty)))
+#define va_copy(dst,src)  (dst = src)
+
+#define __va_arg_next(pap, size, align)  ({ \
+    char *__p = (char*)(((unsigned long)*(pap) + ((align) > 4 ? 7 : 3)) & ~(unsigned long)((align) > 4 ? 7 : 3)); \
+    *(pap) = (void**)(__p + (((size) + 3) & ~3)); \
+    __p; })
+
 #elif (defined(__APPLE__) && defined(__aarch64__)) || defined(__riscv)
 typedef void **va_list;
 

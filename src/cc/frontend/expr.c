@@ -1430,9 +1430,54 @@ static Expr *unnest_arg(Expr *arg, Vector *unnested) {
   return tmp;
 }
 
+#if XCC_TARGET_ARCH == XCC_ARCH_ARM32
+// FPC: ARM32: an operation done by a run-time helper call (doubles, 64-bit
+// division and variable shifts, conversions between doubles or 64-bit
+// integers and floating point) breaks r0-r3, so must be precalculated
+// before the arguments are put there.
+static bool arm32_helper_op(const Expr *arg) {
+  const Type *type = arg->type;
+  bool dbl = is_flonum(type) && type_size(type) > 4;
+  bool i64 = !is_flonum(type) && is_prim_type(type) && type_size(type) > 4;
+  switch (arg->kind) {
+  case EX_ADD: case EX_SUB: case EX_MUL: case EX_DIV:
+    return dbl || (i64 && arg->kind == EX_DIV);
+  case EX_MOD:
+    return i64;
+  case EX_LSHIFT: case EX_RSHIFT:
+    return i64 && arg->bop.rhs->kind != EX_FIXNUM;
+  case EX_EQ: case EX_NE: case EX_LT: case EX_LE: case EX_GE: case EX_GT:
+    {
+      const Type *lt = arg->bop.lhs->type;
+      return is_flonum(lt) && type_size(lt) > 4;
+    }
+  case EX_NEG:
+    return false;
+  case EX_CAST:
+    {
+      const Type *st = arg->unary.sub->type;
+      if (!is_prim_type(type) || !is_prim_type(st))
+        return false;
+      bool sf = is_flonum(st), df = is_flonum(type);
+      if (!sf && !df)
+        return false;
+      if (sf && df)
+        return type_size(st) != type_size(type);
+      return type_size(st) > 4 || type_size(type) > 4;
+    }
+  default:
+    return false;
+  }
+}
+#endif
+
 // If an argument is complex expression,
 // precalculate it and make function argument simple.
 static Expr *simplify_funarg_recur(Expr *arg, Vector *unnested) {
+#if XCC_TARGET_ARCH == XCC_ARCH_ARM32
+  if (arm32_helper_op(arg))
+    return unnest_arg(arg, unnested);
+#endif
   switch (arg->kind) {
   case EX_TERNARY: case EX_FUNCALL: case EX_INLINED: case EX_BLOCK:
   case EX_LOGAND: case EX_LOGIOR:  // Shortcut must be handled properly.

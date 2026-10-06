@@ -644,8 +644,26 @@ static int do_compile(Options *opts, const char *root) {
 
 static void append_predefined_macros(Vector *cpp_cmd) {
   vec_push(cpp_cmd, "-D__XCC");
+#if XCC_TARGET_PROGRAMMING_MODEL == XCC_PROGRAMMING_MODEL_ILP32
+  vec_push(cpp_cmd, "-D__ILP32__");  // FPC: was always LP64
+#else
   vec_push(cpp_cmd, "-D__LP64__");  // Memory model.
-#if XCC_TARGET_ARCH == XCC_ARCH_X64
+#endif
+#if XCC_TARGET_ARCH == XCC_ARCH_ARM32
+  // FPC: Cortex-M33, Thumb-2, the AAPCS with VFP arguments
+  vec_push(cpp_cmd, "-D__arm__");
+  vec_push(cpp_cmd, "-D__thumb__");
+  vec_push(cpp_cmd, "-D__thumb2__");
+  vec_push(cpp_cmd, "-D__ARMEL__");
+  vec_push(cpp_cmd, "-D__ARM_EABI__");
+  vec_push(cpp_cmd, "-D__ARM_ARCH=8");
+  vec_push(cpp_cmd, "-D__ARM_ARCH_8M_MAIN__");
+  vec_push(cpp_cmd, "-D__ARM_ARCH_PROFILE='M'");
+  vec_push(cpp_cmd, "-D__ARM_PCS_VFP");
+  vec_push(cpp_cmd, "-D__VFP_FP__");
+  vec_push(cpp_cmd, "-D__ARM_FP=4");
+  vec_push(cpp_cmd, "-D__SOFTFP_DOUBLE__");
+#elif XCC_TARGET_ARCH == XCC_ARCH_X64
   vec_push(cpp_cmd, "-D__x86_64__");
 #elif XCC_TARGET_ARCH == XCC_ARCH_AARCH64
   vec_push(cpp_cmd, "-D__aarch64__");

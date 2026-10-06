@@ -16,6 +16,10 @@
 #include "util.h"
 #include "var.h"
 
+#if XCC_TARGET_ARCH == XCC_ARCH_ARM32
+#include "../arch/arm32/aapcs.h"
+#endif
+
 bool is_stack_param(const Type *type) {
   return type->kind == TY_STRUCT;
 }
@@ -198,7 +202,7 @@ static VReg *gen_cast(Expr *expr) {
     if (dst_size < (1U << vreg->vsize) && dst_size < sizeof(Fixnum)) {
       // Assume that integer is represented in Two's complement
       size_t bit = dst_size * TARGET_CHAR_BIT;
-      UFixnum mask = (-1UL) << bit;
+      UFixnum mask = ~(UFixnum)0 << bit;  // FPC: was -1UL (32 bits on a 32-bit host)
       if (!is_unsigned(dst_type) && (value & ((Fixnum)1 << (bit - 1))))  // signed && negative
         value |= mask;
       else
@@ -260,11 +264,23 @@ static VReg *gen_ref_sub(Expr *expr) {
     {
       const MemberInfo *member = expr->member.info;
       VReg *vreg = gen_expr(expr->member.target);
-      if (member->offset == 0)
+      // FPC: a member of a packed struct may be unaligned
+      const Type *tt = expr->member.target->type;
+      if (tt->kind == TY_PTR)
+        tt = tt->pa.ptrof;
+      bool packed = tt->kind == TY_STRUCT && (tt->struct_.info->flag & SIF_PACKED) &&
+                    type_size(expr->type) > 1;
+      if (member->offset == 0) {
+        if (packed && !(vreg->flag & VRF_CONST))
+          vreg->flag |= VRF_UNALIGNED;
         return vreg;
+      }
       enum VRegSize vsize = to_vsize(&tySize);
       VReg *imm = new_const_vreg(member->offset, vsize, VRF_UNSIGNED);
-      return new_ir_bop(IR_ADD, vreg, imm, vsize);
+      VReg *result = new_ir_bop(IR_ADD, vreg, imm, vsize);
+      if (packed && !(result->flag & VRF_CONST))
+        result->flag |= VRF_UNALIGNED;
+      return result;
     }
   case EX_COMPLIT:
     {
@@ -387,6 +403,9 @@ typedef struct {
   ssize_t size;
   int reg_index;
   int flag;
+#if XCC_TARGET_ARCH == XCC_ARCH_ARM32
+  int nregs;  // FPC: core registers a struct takes (its rest at offset)
+#endif
 #if STRUCT_ARG_AS_POINTER
   ssize_t indirect_offset;
 #endif
@@ -403,8 +422,60 @@ typedef struct {
 
   // Register arguments.
   int regarg[2];  // [0]=gp-reg, [1]=fp-reg
+#if XCC_TARGET_ARCH == XCC_ARCH_ARM32
+  int small_struct_reg;  // FPC: the core register of a small struct argument
+#endif
 } FuncallWork;
 
+#if XCC_TARGET_ARCH == XCC_ARCH_ARM32
+// FPC: ARM32: every argument placed by the AAPCS (aapcs.h): reg_index is the
+// core register or the s-register itself, not a count.
+static inline ArgInfo *collect_funargs(const Type *functype, Vector *args, FuncallWork *work,
+                                       ArgInfo *arg_infos) {
+  const int arg_count = args->len;
+  int stack_arg_count = 0;
+  int reg_arg_count[2] = {0, 0};
+  AapcsState st;
+  aapcs_init(&st, functype->func.vaargs && functype->func.params != NULL, work->arg_start > 0);
+  for (int i = 0; i < arg_count; ++i) {
+    ArgInfo *p = &arg_infos[i];
+    Expr *arg = args->data[i];
+    const Type *arg_type = arg->type;
+    assert(arg_type->kind != TY_ARRAY);
+    p->reg_index = -1;
+    p->offset = -1;
+    p->size = type_size(arg_type);
+    if (is_flonum(arg_type))
+      p->flag |= ARGF_FLONUM;
+    ArgLoc loc = aapcs_next(&st, arg_type);
+    p->nregs = loc.nregs;
+    switch (loc.kind) {
+    case AL_GP:
+      if (p->flag & ARGF_FLONUM)
+        p->flag |= ARGF_FP_AS_GP;
+      p->reg_index = loc.reg;
+      ++reg_arg_count[GPREG];
+      if (loc.offset >= 0) {  // A struct split: its rest on the stack.
+        p->offset = loc.offset;
+        ++stack_arg_count;
+      }
+      break;
+    case AL_FP:
+      p->reg_index = loc.reg;
+      ++reg_arg_count[FPREG];
+      break;
+    case AL_STACK:
+      p->offset = loc.offset;
+      ++stack_arg_count;
+      break;
+    }
+  }
+  work->offset = ALIGN(st.nsaa, 8);
+  work->stack_arg_count = stack_arg_count;
+  memcpy(work->reg_arg_count, reg_arg_count, sizeof(work->reg_arg_count));
+  return arg_infos;
+}
+#else
 static inline ArgInfo *collect_funargs(const Type *functype, Vector *args, FuncallWork *work,
                                        ArgInfo *arg_infos) {
   ssize_t offset = 0;
@@ -494,6 +565,7 @@ static inline ArgInfo *collect_funargs(const Type *functype, Vector *args, Funca
 
   return arg_infos;
 }
+#endif
 
 #if STRUCT_ARG_AS_POINTER
 static inline VReg *gen_funarg_struct_pointer(
@@ -527,6 +599,18 @@ static inline VReg *gen_funarg_struct_pointer(
 #endif
 
 static inline void gen_funarg_small_struct(Expr *arg, VReg *vreg, FuncallWork *work) {
+#if XCC_TARGET_ARCH == XCC_ARCH_ARM32
+  // FPC: ARM32: a small struct is at most 4 bytes, in one core register
+  {
+    size_t size = type_size(arg->type);
+    if (size == 0)
+      return;
+    enum VRegSize vsize = (enum VRegSize)(most_significant_bit(size) + (IS_POWER_OF_2(size) ? 0 : 1));
+    VReg *loaded = new_ir_load(vreg, 0, vsize, VRF_PARAM | VRF_UNSIGNED)->dst;
+    new_ir_pusharg(loaded, work->small_struct_reg);
+    return;
+  }
+#endif
   const enum VRegSize kMaxVSize = VRegSize8;  // TODO: Max
   const size_t kMaxSize = 1U << kMaxVSize;
   size_t size = type_size(arg->type);
@@ -562,11 +646,23 @@ static inline VReg *gen_funarg_stack(Expr *arg, const ArgInfo *arg_info) {
 
 static inline VReg *gen_funarg_reg(Expr *arg, const ArgInfo *arg_info, FuncallWork *work) {
   VReg *vreg = gen_expr(arg);
+#if XCC_TARGET_ARCH == XCC_ARCH_ARM32
+  work->small_struct_reg = arg_info->reg_index;
+#endif
   if (arg->type->kind == TY_STRUCT) {
     assert(is_small_struct(arg->type));
     gen_funarg_small_struct(arg, vreg, work);
     return NULL;
   }
+#if XCC_TARGET_ARCH == XCC_ARCH_ARM32
+  {
+    // FPC: ARM32: the register the AAPCS gave it
+    IR *ir = new_ir_pusharg(vreg, arg_info->reg_index);
+    if (arg_info->flag & ARGF_FP_AS_GP)
+      ir->pusharg.fp_as_gp = true;
+    return vreg;
+  }
+#endif
 
   bool is_flo = (arg_info->flag & (ARGF_FLONUM | ARGF_FP_AS_GP)) == ARGF_FLONUM;
   int regarg = ++work->regarg[is_flo];
@@ -639,6 +735,59 @@ static inline void gen_funargs(Expr *expr, FuncallWork *work) {
                                           : calloc_or_die(total_arg_count * sizeof(*arg_vregs));
   work->arg_vregs = arg_vregs;
 
+#if XCC_TARGET_ARCH == XCC_ARCH_ARM32
+  // FPC: ARM32: first what goes on the stack (a struct's address is worked
+  // out once, its part on the stack copied there), then the registers (a
+  // struct's first words loaded from it).
+  {
+    VReg **struct_addrs = ALLOCA(sizeof(*struct_addrs) * (args->len + 1));
+    for (int j = args->len; --j >= 0; ) {
+      Expr *arg = args->data[j];
+      const ArgInfo *ai = &arg_infos[j];
+      struct_addrs[j] = NULL;
+      if (arg->type->kind == TY_STRUCT) {
+        VReg *addr = gen_expr(arg);
+        struct_addrs[j] = addr;
+        size_t size = type_size(arg->type);
+        size_t inregs = ai->reg_index >= 0 ? (size_t)ai->nregs * 4 : 0;
+        if (ai->offset >= 0 && size > inregs) {
+          VReg *dst = new_ir_sofs(new_const_vreg(ai->offset, VRegSize4, 0))->dst;
+          VReg *src = addr;
+          if (inregs > 0)
+            src = new_ir_bop(IR_ADD, addr, new_const_vreg(inregs, VRegSize4, VRF_UNSIGNED),
+                             VRegSize4);
+          // The rest, byte by byte if it is not a whole number of words.
+          size_t rest = size - inregs;
+          Type *t = arrayof(rest % 4 == 0 ? &tyInt : &tyChar,
+                            rest % 4 == 0 ? rest / 4 : rest);
+          gen_memcpy(t, dst, src);
+        }
+        arg_vregs[j + work->arg_start] = NULL;
+      } else if (ai->offset >= 0) {
+        arg_vregs[j + work->arg_start] = gen_funarg_stack(arg, ai);
+      }
+    }
+    for (int j = args->len; --j >= 0; ) {
+      Expr *arg = args->data[j];
+      const ArgInfo *ai = &arg_infos[j];
+      if (ai->reg_index < 0)
+        continue;
+      if (arg->type->kind == TY_STRUCT) {
+        size_t size = type_size(arg->type);
+        for (int k = 0; k < ai->nregs; ++k) {
+          size_t rem = size - 4 * k;
+          enum VRegSize vsize = rem >= 4 ? VRegSize4 :
+              (enum VRegSize)(most_significant_bit(rem) + (IS_POWER_OF_2(rem) ? 0 : 1));
+          VReg *loaded = new_ir_load(struct_addrs[j], 4 * k, vsize, VRF_PARAM | VRF_UNSIGNED)->dst;
+          new_ir_pusharg(loaded, ai->reg_index + k);
+        }
+        continue;
+      }
+      VReg *vreg = gen_funarg_reg(arg, ai, work);
+      arg_vregs[j + work->arg_start] = vreg;
+    }
+  }
+#else
   for (int i = 0; i < 2; ++i) {  // Put struct argument onto stack frame first, then handle rest.
     bool prepare_struct = i == 0;
     work->regarg[GPREG] = work->regarg[FPREG] = 0;
@@ -648,6 +797,7 @@ static inline void gen_funargs(Expr *expr, FuncallWork *work) {
       arg_vregs[j + work->arg_start] = vreg;
     }
   }
+#endif
 
   if (ret_varinfo != NULL && !work->ret_small_struct) {
     VReg *dst = new_ir_bofs(ret_varinfo->local.frameinfo)->dst;

@@ -34,6 +34,24 @@ static void start2(int argc, char *argv[], char *env[]) {
   exit(ec);
 }
 
+#if defined(__arm__)
+// FPC: ARM EABI Linux: argc at [sp], argv after it, envp after argv's NULL;
+// in assembly (a function of the compiler's would push first).
+void __xcc_start2(int argc, char *argv[], char *env[]) {
+  start2(argc, argv, env);
+}
+__asm(
+    "  .text\n"
+    "  .globl _start\n"
+    "  .type _start, %function\n"
+    "  .thumb_func\n"
+    "_start:\n"
+    "  ldr r0, [sp]\n"
+    "  add r1, sp, #4\n"
+    "  add r2, r1, r0, lsl #2\n"
+    "  add r2, r2, #4\n"
+    "  b __xcc_start2\n");
+#else
 void _start(void) {
   (void)start2;  // Avoid warning: unused function 'start2'
 #if defined(__x86_64__)
@@ -61,6 +79,7 @@ void _start(void) {
 #error unknown target
 #endif
 }
+#endif  // __arm__
 
 #elif defined(__APPLE__)
 

@@ -184,6 +184,67 @@
 #define __NR_unlinkat  35
 #define __NR_renameat  38
 
+#elif defined(__arm__)
+
+// FPC: ARM EABI (Linux, for testing xcc's ARM32 target under qemu-arm):
+// the number in r7 (callee-saved, xcc's frame pointer: kept), the
+// arguments in r0-r6 (where the function's parameters already are).
+
+#define SYSCALL(no, ...) \
+    __asm volatile( \
+        "push {r7}\n" \
+        "mov r7, %0\n" \
+        "svc #0\n" \
+        "pop {r7}" \
+        : /* no output */ \
+        : "ri"(no), ## __VA_ARGS__)
+
+#define SYSCALL_RET(no, ret, ...) \
+    __asm volatile( \
+        "push {r7}\n" \
+        "mov r7, %1\n" \
+        "svc #0\n" \
+        "pop {r7}\n" \
+        "mov %0, r0" \
+        : "=r"(ret) \
+        : "ri"(no), ## __VA_ARGS__)
+
+#define __NR_exit      1
+#define __NR_fork      2
+#define __NR_read      3
+#define __NR_write     4
+#define __NR_open      5
+#define __NR_close     6
+#define __NR_unlink   10
+#define __NR_execve   11
+#define __NR_chdir    12
+#define __NR_chmod    15
+#define __NR_lseek    19
+#define __NR_getpid   20
+#define __NR_kill     37
+#define __NR_rename   38
+#define __NR_mkdir    39
+#define __NR_rmdir    40
+#define __NR_dup      41
+#define __NR_pipe     42
+#define __NR_brk      45
+#define __NR_ioctl    54
+#define __NR_getppid  64
+#define __NR_stat    195  // stat64, lstat64, fstat64: struct stat is theirs
+#define __NR_lstat   196
+#define __NR_fstat   197
+#define __NR_wait4   114
+#define __NR_getcwd  183
+#define __NR_exit_group  248
+#define __NR_clock_gettime  263
+#define __NR_openat   322
+#define __NR_mkdirat  323
+#define __NR_unlinkat 328
+#define __NR_renameat 329
+#define __NR_fchmodat 333
+#define __NR_pipe2    359
+#define __NR_clone3   435
+
 #else
 #error unknown
 #endif

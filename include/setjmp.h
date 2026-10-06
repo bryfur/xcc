@@ -13,6 +13,9 @@ typedef uintptr_t jmp_buf[200 / 8];  // GCC
 
 #elif defined(__riscv)
 typedef uintptr_t jmp_buf[208 / 8];
+
+#elif defined(__arm__)
+typedef uintptr_t jmp_buf[26];  // FPC: r4-r11, sp, lr, s16-s31
 #endif
 
 int setjmp(jmp_buf env);

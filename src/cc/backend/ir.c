@@ -8,7 +8,7 @@
 #include "table.h"
 #include "util.h"
 
-static const enum VRegSize vtVoidPtr = VRegSize8;
+static const enum VRegSize vtVoidPtr = TARGET_POINTER_SIZE == 4 ? VRegSize4 : VRegSize8;  // FPC: was always 8
 static const enum VRegSize vtBool = VRegSize1;
 
 Phi *new_phi(VReg *dst, Vector *params) {
@@ -236,6 +236,7 @@ IR *new_ir_load(VReg *opr, int64_t offset, enum VRegSize vsize, int vflag) {
   IR *ir = new_ir(IR_LOAD);
   ir->opr1 = opr;
   ir->load.offset = offset;
+  ir->load.unaligned = (opr->flag & VRF_UNALIGNED) != 0;
   ir->dst = reg_alloc_spawn(curra, vsize, vflag);
   return ir;
 }
@@ -270,6 +271,7 @@ IR *new_ir_store(VReg *dst, int64_t offset, VReg *src) {
   ir->opr1 = src;
   ir->opr2 = dst;  // `dst` is used by indirect, so it is not actually `dst`.
   ir->store.offset = offset;
+  ir->store.unaligned = (dst->flag & VRF_UNALIGNED) != 0;
   return ir;
 }
 
@@ -312,7 +314,7 @@ IR *new_ir_pusharg(VReg *vreg, int index) {
   IR *ir = new_ir(IR_PUSHARG);
   ir->opr1 = vreg;
   ir->pusharg.index = index;
-#if VAARG_FP_AS_GP
+#if VAARG_FP_AS_GP || PUSHARG_FP_AS_GP
   ir->pusharg.fp_as_gp = false;
 #endif
   return ir;

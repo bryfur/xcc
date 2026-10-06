@@ -34,6 +34,19 @@ int setjmp(jmp_buf env) {
       : /* no output */
       : "r"(env));
 }
+#elif defined(__arm__)
+// FPC: in assembly (no prologue of the compiler's in the way)
+__asm(
+    "  .text\n"
+    "  .globl setjmp\n"
+    "  .type setjmp, %function\n"
+    "  .thumb_func\n"
+    "setjmp:\n"
+    "  mov ip, sp\n"
+    "  stmia r0!, {r4, r5, r6, r7, r8, r9, r10, r11, ip, lr}\n"
+    "  vstmia r0, {s16-s31}\n"
+    "  mov r0, #0\n"
+    "  bx lr\n");
 #elif defined(__aarch64__)
 int setjmp(jmp_buf env) {
 #ifdef __NO_FLONUM

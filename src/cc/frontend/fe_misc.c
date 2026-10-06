@@ -477,6 +477,9 @@ bool is_small_struct(const Type *type) {
   }
   const MemberInfo *member = &sinfo->members[0];
   return is_prim_type(member->type) || is_small_struct(member->type);
+#elif XCC_TARGET_ARCH == XCC_ARCH_ARM32
+  // FPC: AAPCS: returned in r0 (larger: in the caller's buffer)
+  return type_size(type) <= 4;
 #else
   return type_size(type) <= TARGET_POINTER_SIZE * 2;
 #endif

@@ -38,6 +38,22 @@ void longjmp(jmp_buf env, int result) {
       : /* no output */
       : "r"(env), "r"(result));
 }
+#elif defined(__arm__)
+// FPC: in assembly (no prologue of the compiler's in the way)
+__asm(
+    "  .text\n"
+    "  .globl longjmp\n"
+    "  .type longjmp, %function\n"
+    "  .thumb_func\n"
+    "longjmp:\n"
+    "  add ip, r0, #40\n"
+    "  vldmia ip, {s16-s31}\n"
+    "  ldmia r0, {r4, r5, r6, r7, r8, r9, r10, r11, ip, lr}\n"
+    "  mov sp, ip\n"
+    "  movs r0, r1\n"
+    "  it eq\n"
+    "  moveq r0, #1\n"
+    "  bx lr\n");
 #elif defined(__aarch64__)
 void longjmp(jmp_buf env, int result) {
 #ifdef __NO_FLONUM

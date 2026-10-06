@@ -5,6 +5,7 @@
 #define XCC_ARCH_AARCH64  2
 #define XCC_ARCH_RISCV64  3
 #define XCC_ARCH_WASM     4
+#define XCC_ARCH_ARM32    5  // FPC: ARMv8-M Mainline (Cortex-M33), Thumb-2
 
 #if !defined(XCC_TARGET_ARCH)
 # if defined(__wasm)
@@ -15,6 +16,8 @@
 #  define XCC_TARGET_ARCH  XCC_ARCH_AARCH64
 # elif defined(__riscv) && defined(__LP64__)
 #  define XCC_TARGET_ARCH  XCC_ARCH_RISCV64
+# elif defined(__arm__)
+#  define XCC_TARGET_ARCH  XCC_ARCH_ARM32
 # else
 #  error "Target architecture unspecified"
 # endif
@@ -68,12 +71,19 @@
 #define VAARG_FP_AS_GP  1
 #endif
 
+// FPC: ARM32: a variadic call passes floating-point arguments in core
+// registers (the AAPCS base standard), each PUSHARG says which.
+#if XCC_TARGET_ARCH == XCC_ARCH_ARM32
+#define PUSHARG_FP_AS_GP  1
+#endif
+
 #if !defined(USE_GP_FOR_OVERFLOW_FP) && XCC_TARGET_ARCH == XCC_ARCH_RISCV64
 // Pass floating-point arguments in general-purpose registers if FP registers are fully-used.
 #define USE_GP_FOR_OVERFLOW_FP  1
 #endif
 
-#if !defined(STRUCT_ARG_AS_POINTER) && XCC_TARGET_ARCH != XCC_ARCH_X64
+#if !defined(STRUCT_ARG_AS_POINTER) && XCC_TARGET_ARCH != XCC_ARCH_X64 && \
+    XCC_TARGET_ARCH != XCC_ARCH_ARM32
 // Put struct pointer instead of instance
 #define STRUCT_ARG_AS_POINTER  1
 #endif
@@ -88,7 +98,7 @@
 #define XCC_PROGRAMMING_MODEL_ILP32  1
 #define XCC_PROGRAMMING_MODEL_LP64   2
 
-#if XCC_TARGET_ARCH == XCC_ARCH_WASM
+#if XCC_TARGET_ARCH == XCC_ARCH_WASM || XCC_TARGET_ARCH == XCC_ARCH_ARM32
 #define XCC_TARGET_PROGRAMMING_MODEL  XCC_PROGRAMMING_MODEL_ILP32
 #else
 #define XCC_TARGET_PROGRAMMING_MODEL  XCC_PROGRAMMING_MODEL_LP64
@@ -117,6 +127,10 @@
 #define MINREGSIZE  (4)  // 8
 
 #elif XCC_TARGET_ARCH == XCC_ARCH_WASM
+#define MINREGSIZE  (4)
+
+#elif XCC_TARGET_ARCH == XCC_ARCH_ARM32
+#define MACHINE_TYPE  EM_ARM
 #define MINREGSIZE  (4)
 
 #endif

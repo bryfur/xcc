@@ -70,6 +70,35 @@ struct stat {
   /*__syscall_slong_t*/ long __glibc_reserved[3];
 };
 
+#elif defined(__arm__)
+// FPC: ARM EABI Linux: the kernel's struct stat64 (fstat64...)
+typedef unsigned long long dev_t;
+typedef int mode_t;
+typedef unsigned int nlink_t;
+typedef unsigned long blksize_t;
+
+struct stat {
+  dev_t     st_dev;
+  unsigned char __pad0[4];
+  unsigned long __st_ino;
+  mode_t    st_mode;
+  nlink_t   st_nlink;
+  uid_t     st_uid;
+  gid_t     st_gid;
+  dev_t     st_rdev;
+  unsigned char __pad3[4];
+  long long st_size;
+  blksize_t st_blksize;
+  unsigned long long st_blocks;
+  struct timespec st_atim;
+  struct timespec st_mtim;
+  struct timespec st_ctim;
+#define st_atime st_atim.tv_sec
+#define st_mtime st_mtim.tv_sec
+#define st_ctime st_ctim.tv_sec
+  unsigned long long st_ino;
+};
+
 #else
 typedef unsigned long dev_t;
 typedef int mode_t;

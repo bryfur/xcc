@@ -289,7 +289,9 @@ static void emit_varinfo(const VarInfo *varinfo, const Initializer *init) {
     label = quote_label(label);
     _LOCAL(label);
   }
-#if XCC_TARGET_PLATFORM != XCC_PLATFORM_APPLE
+#if XCC_TARGET_ARCH == XCC_ARCH_ARM32
+  EMIT_ASM(".type", quote_label(fmt_name(name)), "%object");  // FPC: '@' starts a comment
+#elif XCC_TARGET_PLATFORM != XCC_PLATFORM_APPLE
   EMIT_ASM(".type", quote_label(fmt_name(name)), "@object");
 #endif
 
@@ -437,7 +439,11 @@ static void emit_decls_ctor_dtor_priority(Vector *container, const char *section
       const VarInfo *varinfo = scope_find(global_scope, name, NULL);
       if (varinfo != NULL)
         global = (varinfo->storage & VS_STATIC) == 0;
+#if TARGET_POINTER_SIZE == 4
+      _LONG(format_func_name(name, global));  // FPC
+#else
       _QUAD(format_func_name(name, global));
+#endif
     }
   }
 }
@@ -576,6 +582,10 @@ static inline void emit_alias(const VarInfo *varinfo, const VarInfo *alias) {
 }
 
 void emit_code(Vector *decls) {
+#if XCC_TARGET_ARCH == XCC_ARCH_ARM32
+  extern void emit_arm32_preamble(void);
+  emit_arm32_preamble();  // FPC
+#endif
   for (int i = 0, len = decls->len; i < len; ++i) {
     Declaration *decl = decls->data[i];
     if (decl == NULL)

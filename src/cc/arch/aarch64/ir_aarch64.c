@@ -80,7 +80,7 @@ static const int kCalleeSaveFRegs[] = {8, 9, 10, 11, 12, 13, 14, 15};
 #define CALLER_SAVE_FREG_COUNT  ((int)ARRAY_SIZE(kCallerSaveFRegs))
 static const int kCallerSaveFRegs[] = {16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31};
 
-static unsigned long detect_extra_occupied(RegAlloc *ra, IR *ir) {
+static RegBits detect_extra_occupied(RegAlloc *ra, IR *ir) {
   unsigned long ioccupy = 0;
   switch (ir->kind) {
   case IR_CALL:
@@ -174,7 +174,7 @@ void pop_callee_save_regs(unsigned long used, unsigned long fused) {
 int calculate_func_param_bottom(Function *func) {
   const char *saves[(N + 1) & ~1];
   FuncBackend *fnbe = func->extra;
-  const unsigned long *pused = fnbe->ra->used_reg_bits;
+  const RegBits *pused = fnbe->ra->used_reg_bits;
   int count = enum_callee_save_regs(pused[GPREG], CALLEE_SAVE_REG_COUNT, kCalleeSaveRegs,
                                     kReg64s, saves);
   int fcount = enum_callee_save_regs(pused[FPREG], CALLEE_SAVE_FREG_COUNT, kCalleeSaveFRegs,

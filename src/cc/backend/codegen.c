@@ -20,6 +20,10 @@
 #include "util.h"
 #include "var.h"
 
+#if XCC_TARGET_ARCH == XCC_ARCH_ARM32
+#include "../arch/arm32/aapcs.h"
+#endif
+
 void set_curbb(BB *bb) {
   assert(bb != NULL);
   assert(curfunc != NULL);
@@ -77,6 +81,13 @@ static inline VarInfo *prepare_retvar(Function *func) {
   return varinfo;
 }
 
+#if XCC_TARGET_ARCH == XCC_ARCH_ARM32
+static bool fnbe_has_struct_retvar(Function *func) {
+  FuncBackend *fnbe = func->extra;
+  return fnbe->struct_retvar != NULL;
+}
+#endif
+
 static void alloc_variable_registers(Function *func) {
   assert(func->type->kind == TY_FUNC);
 
@@ -127,6 +138,38 @@ static void alloc_variable_registers(Function *func) {
     ++regcount[GPREG];
 #endif
   }
+
+#if XCC_TARGET_ARCH == XCC_ARCH_ARM32
+  // FPC: ARM32: each parameter where the AAPCS puts it (aapcs.h)
+  {
+    UNUSED(regcount);
+    const Vector *params = func->params;
+    AapcsState st;
+    aapcs_init(&st, func->type->func.vaargs, fnbe_has_struct_retvar(func));
+    for (int i = 0; params != NULL && i < params->len; ++i) {
+      VarInfo *varinfo = params->data[i];
+      ArgLoc loc = aapcs_next(&st, varinfo->type);
+      VReg *vreg = varinfo->local.vreg;
+      if (vreg == NULL)
+        continue;
+      vreg->flag |= VRF_PARAM;
+      switch (loc.kind) {
+      case AL_GP:
+        vreg->reg_param_index = loc.reg;
+        if (vreg->flag & VRF_FLONUM)
+          vreg->flag |= VRF_FP_GP_PARAM;
+        break;
+      case AL_FP:
+        vreg->reg_param_index = loc.reg;
+        break;
+      case AL_STACK:
+        vreg->flag |= VRF_STACK_PARAM;
+        break;
+      }
+    }
+    return;
+  }
+#endif
 
   // Count register parameters, or set flag.
   const Vector *params = func->params;
@@ -918,7 +961,7 @@ void map_virtual_to_physical_registers(RegAlloc *ra) {
 // Detect living registers for each instruction.
 void detect_living_registers(RegAlloc *ra, BBContainer *bbcon) {
   int maxbit = ra->settings->regset[GPREG].phys_max + ra->settings->regset[FPREG].phys_max;
-  unsigned long living_pregs = 0;
+  RegBits living_pregs = 0;
   assert((int)sizeof(living_pregs) * CHAR_BIT >= maxbit);
   LiveInterval **livings = ALLOCA(sizeof(*livings) * maxbit);
   for (int i = 0; i < maxbit; ++i)
@@ -936,8 +979,12 @@ void detect_living_registers(RegAlloc *ra, BBContainer *bbcon) {
     if (li->state != LI_NORMAL || VREGFOR(li, ra) == NULL)
       continue;
     int bitno = BITNO(li, ra);
-    living_pregs |= 1UL << bitno;
+    living_pregs |= REGBIT(bitno);
     livings[bitno] = li;
+    if (vreg_reg_width(ra, VREGFOR(li, ra)) == 2) {  // FPC: a pair
+      living_pregs |= REGBIT(bitno + 1);
+      livings[bitno + 1] = li;
+    }
   }
 
   int nip = 0, head = 0;
@@ -948,8 +995,8 @@ void detect_living_registers(RegAlloc *ra, BBContainer *bbcon) {
       for (int k = 0; k < maxbit; ++k) {
         LiveInterval *li = livings[k];
         if (li != NULL && nip == li->end) {
-          assert(BITNO(li, ra) == k);
-          living_pregs &= ~(1UL << k);
+          assert(BITNO(li, ra) == k || BITNO(li, ra) + 1 == k);
+          living_pregs &= ~REGBIT(k);
           livings[k] = NULL;
         }
       }
@@ -970,8 +1017,12 @@ void detect_living_registers(RegAlloc *ra, BBContainer *bbcon) {
         if (nip == li->start) {
           assert(VREGFOR(li, ra) != NULL);
           int bitno = BITNO(li, ra);
-          living_pregs |= 1UL << bitno;
+          living_pregs |= REGBIT(bitno);
           livings[bitno] = li;
+          if (vreg_reg_width(ra, VREGFOR(li, ra)) == 2) {  // FPC: a pair
+            living_pregs |= REGBIT(bitno + 1);
+            livings[bitno + 1] = li;
+          }
         }
       }
     }
@@ -980,6 +1031,45 @@ void detect_living_registers(RegAlloc *ra, BBContainer *bbcon) {
 #undef VREGFOR
 }
 
+#if XCC_TARGET_ARCH == XCC_ARCH_ARM32
+// FPC: ARM32: the parameters' places by the AAPCS (aapcs.h): those in
+// registers keep them (a small struct gets a frame slot, stored there on
+// entry), those on the stack are addressed where the caller put them.
+static size_t alloc_params_onto_stack_frame(Function *func, bool *prequire_stack_frame) {
+  FuncBackend *fnbe = func->extra;
+  assert(fnbe->frame_size == 0);
+  size_t frame_size = 0;
+  int param_offset = calculate_func_param_bottom(func);
+  fnbe->vaarg_frame_info.offset = param_offset;
+  bool require_stack_frame = false;
+
+  AapcsState st;
+  aapcs_init(&st, func->type->func.vaargs, fnbe->struct_retvar != NULL);
+  for (int i = 0; i < func->params->len; ++i) {
+    VarInfo *varinfo = func->params->data[i];
+    assert(is_local_storage(varinfo));
+    const Type *type = varinfo->type;
+    ArgLoc loc = aapcs_next(&st, type);
+    FrameInfo *fi = varinfo->local.frameinfo;
+    VReg *vreg = varinfo->local.vreg;
+    if (vreg == NULL && loc.kind == AL_GP) {
+      // A struct in core registers (and maybe the stack): r0-r3 were pushed
+      // on entry, just below the stack arguments: it is whole there.
+      fi->offset = param_offset - 16 + 4 * loc.reg;
+      require_stack_frame = true;
+      continue;
+    }
+    if (vreg != NULL && !(vreg->flag & VRF_STACK_PARAM))
+      continue;  // Passed by register.
+    assert(loc.kind == AL_STACK);
+    fi->offset = param_offset + loc.offset;
+    require_stack_frame = true;
+  }
+
+  *prequire_stack_frame = require_stack_frame;
+  return frame_size;
+}
+#else
 static size_t alloc_params_onto_stack_frame(Function *func, bool *prequire_stack_frame) {
   FuncBackend *fnbe = func->extra;
   assert(fnbe->frame_size == 0);
@@ -1046,6 +1136,7 @@ static size_t alloc_params_onto_stack_frame(Function *func, bool *prequire_stack
   *prequire_stack_frame = require_stack_frame;
   return frame_size;
 }
+#endif
 
 static size_t alloc_locals_onto_stack_frame(Function *func, size_t frame_size) {
   for (int i = 0; i < func->scopes->len; ++i) {
