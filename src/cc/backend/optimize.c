@@ -795,7 +795,7 @@ static void coalesce_moves(RegAlloc *ra, BBContainer *bbcon) {
         case IR_ADD: case IR_SUB: case IR_MUL: case IR_DIV: case IR_MOD:
         case IR_BITAND: case IR_BITOR: case IR_BITXOR: case IR_LSHIFT: case IR_RSHIFT:
         case IR_COND: case IR_NEG: case IR_BITNOT: case IR_CAST: case IR_MOV:
-        case IR_LOAD: case IR_BOFS: case IR_IOFS:
+        case IR_LOAD: case IR_BOFS: case IR_IOFS: case IR_CALL:
           break;
         default:
           continue;
