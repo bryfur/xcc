@@ -1688,7 +1688,10 @@ static void hoist_loop_invariants(RegAlloc *ra, BBContainer *bbcon) {
         // moved out already; not a base + constant (an address the
         // load's offset takes), a few at most.  Out of a loop with loops
         // in it: an address of a global only.
-        bool worth = ir->kind == IR_IOFS || (inner && ir->kind == IR_MUL);
+        bool worth = ir->kind == IR_IOFS || (inner && ir->kind == IR_MUL) ||
+                     (inner && ir->kind != IR_CAST &&
+                      !((ir->kind == IR_ADD || ir->kind == IR_SUB) && ir->opr2 != NULL &&
+                        (ir->opr2->flag & VRF_CONST)));
         for (int o = 0; o < 2 && !worth; ++o) {
           VReg *opr = oprs[o];
           if (opr != NULL && !(opr->flag & VRF_CONST) && hoisted[opr->virt])
