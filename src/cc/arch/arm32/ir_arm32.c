@@ -381,6 +381,12 @@ static void unaligned_store(IR *ir) {
 }
 
 #define ei_load_s  ei_load
+static const char *indexed(VReg *base, VReg *index, int shift) {
+  assert(!(base->flag & VRF_CONST) && !(index->flag & VRF_CONST));
+  return shift != 0 ? fmt("[%s, %s, lsl #%d]", R(base), R(index), shift)
+                    : fmt("[%s, %s]", R(base), R(index));
+}
+
 static void ei_load(IR *ir) {
   assert(!(ir->opr1->flag & VRF_CONST));
   bool spilled = ir->kind != IR_LOAD;
@@ -402,6 +408,15 @@ static void ei_load(IR *ir) {
   bool u = (dst->flag & VRF_UNSIGNED) != 0;
   const char *op;
   enum MemKind mk = MK_WORD;
+  if (!spilled && ir->opr2 != NULL) {  // [base, index, lsl #n] (fuse_indexed_access)
+    switch (dst->vsize) {
+    case VRegSize1:  op = u ? "ldrb" : "ldrsb"; break;
+    case VRegSize2:  op = u ? "ldrh" : "ldrsh"; break;
+    default:         op = "ldr"; break;
+    }
+    EMIT_ASM(op, R(dst), indexed(ir->opr1, ir->opr2, ir->load.index_shift));
+    return;
+  }
   switch (dst->vsize) {
   case VRegSize1:  op = u ? "ldrb" : "ldrsb"; if (!u) mk = MK_SIGNED; break;
   case VRegSize2:  op = u ? "ldrh" : "ldrsh"; if (!u) mk = MK_SIGNED; break;
@@ -438,6 +453,17 @@ static void ei_store(IR *ir) {
   case VRegSize1:  op = "strb"; break;
   case VRegSize2:  op = "strh"; break;
   default:         op = "str"; break;
+  }
+  if (!spilled && ir->additional_operands != NULL) {  // fuse_indexed_access
+    VReg *index = ir->additional_operands->data[0];
+    const char *target = indexed(ir->opr2, index, ir->store.index_shift);
+    if (src->flag & VRF_CONST) {
+      mov_immediate(IP, src->fixnum);
+      EMIT_ASM(op, IP, target);
+    } else {
+      EMIT_ASM(op, R(src), target);
+    }
+    return;
   }
   if (src->flag & VRF_CONST) {
     // The value in ip, so the address must be computed without it.
@@ -1177,9 +1203,142 @@ const EmitIrFunc kEmitIrFuncTable[] = {
 
 //
 
+// FPC: base + (index << n) for a load or store (an array's element) in its
+// addressing mode, [base, index, lsl #n], when the sum and the shift are
+// temporaries made for it in the same block.
+
+static IR *def_in_bb(Vector *irs, int before, VReg *v, int *pos) {
+  for (int k = before - 1; k >= 0; --k) {
+    IR *ir = irs->data[k];
+    if (ir->dst == v) {
+      *pos = k;
+      return ir;
+    }
+  }
+  return NULL;
+}
+
+static bool defined_between(Vector *irs, int from, int to, VReg *v) {
+  for (int k = from + 1; k < to; ++k) {
+    IR *ir = irs->data[k];
+    if (ir->dst == v)
+      return true;
+  }
+  return false;
+}
+
+static void count_uses_defs(RegAlloc *ra, BBContainer *bbcon, int *uses, int *defs) {
+  for (int i = 0; i < ra->vregs->len * 2; ++i)
+    uses[i] = 0;
+  for (int i = 0; i < bbcon->len; ++i) {
+    BB *bb = bbcon->data[i];
+    for (int j = 0; j < bb->irs->len; ++j) {
+      IR *ir = bb->irs->data[j];
+      VReg *operands[] = {ir->opr1, ir->opr2};
+      int n = 2 + (ir->additional_operands != NULL ? ir->additional_operands->len : 0);
+      for (int k = 0; k < n; ++k) {
+        VReg *vreg = k < 2 ? operands[k] : ir->additional_operands->data[k - 2];
+        if (vreg != NULL && !(vreg->flag & VRF_CONST))
+          ++uses[vreg->virt];
+      }
+      if (ir->dst != NULL && !(ir->dst->flag & VRF_CONST))
+        ++defs[ir->dst->virt];
+    }
+  }
+}
+
+static bool plain_reg(VReg *v) {
+  return v != NULL && !(v->flag & (VRF_CONST | VRF_FLONUM | VRF_FORCEMEMORY | VRF_VOLATILEREG)) &&
+         v->vsize == VRegSize4;
+}
+
+static void fuse_indexed_access(RegAlloc *ra, BBContainer *bbcon) {
+  int vreg_count = ra->vregs->len;
+  int *uses = malloc_or_die(sizeof(*uses) * vreg_count * 2);
+  int *defs = uses + vreg_count;
+  count_uses_defs(ra, bbcon, uses, defs);
+  for (int i = 0; i < bbcon->len; ++i) {
+    BB *bb = bbcon->data[i];
+    Vector *irs = bb->irs;
+    for (int j = 0; j < irs->len; ++j) {
+      IR *ir = irs->data[j];
+      VReg *addr, *value = NULL;
+      if (ir->kind == IR_LOAD) {
+        if (ir->opr2 != NULL || ir->load.unaligned || ir->load.offset != 0 ||
+            (ir->dst->flag & VRF_FLONUM) || ir->dst->vsize > VRegSize4)
+          continue;
+        addr = ir->opr1;
+      } else if (ir->kind == IR_STORE) {
+        value = ir->opr1;
+        if (ir->additional_operands != NULL || ir->store.unaligned || ir->store.offset != 0 ||
+            (value->flag & VRF_FLONUM) || value->vsize > VRegSize4)
+          continue;
+        addr = ir->opr2;
+      } else {
+        continue;
+      }
+      if (!plain_reg(addr) || uses[addr->virt] != 1 || defs[addr->virt] != 1 ||
+          (addr->flag & (VRF_PARAM | VRF_UNALIGNED)))
+        continue;
+      int kadd;
+      IR *add = def_in_bb(irs, j, addr, &kadd);
+      if (add == NULL || add->kind != IR_ADD || !plain_reg(add->opr1) || !plain_reg(add->opr2))
+        continue;
+      VReg *base = NULL, *index = NULL;
+      int shift = 0, kshl = -1;
+      for (int side = 0; side < 2 && base == NULL; ++side) {
+        VReg *x = side == 0 ? add->opr2 : add->opr1;
+        VReg *b = side == 0 ? add->opr1 : add->opr2;
+        if (uses[x->virt] != 1 || defs[x->virt] != 1 || (x->flag & VRF_PARAM))
+          continue;
+        int k;
+        IR *shl = def_in_bb(irs, kadd, x, &k);
+        if (shl != NULL && shl->kind == IR_LSHIFT && plain_reg(shl->opr1) &&
+            (shl->opr2->flag & VRF_CONST) && shl->opr2->fixnum >= 0 && shl->opr2->fixnum <= 3 &&
+            !defined_between(irs, k, j, shl->opr1) && shl->opr1 != addr) {
+          base = b;
+          index = shl->opr1;
+          shift = shl->opr2->fixnum;
+          kshl = k;
+        }
+      }
+      if (base == NULL) {
+        base = add->opr1;
+        index = add->opr2;
+      }
+      if (defined_between(irs, kadd, j, base) || defined_between(irs, kadd, j, index))
+        continue;
+      if (ir->kind == IR_LOAD) {
+        ir->opr1 = base;
+        ir->opr2 = index;
+        ir->load.index_shift = shift;
+      } else {
+        ir->opr2 = base;
+        ir->additional_operands = new_vector();
+        vec_push(ir->additional_operands, index);
+        ir->store.index_shift = shift;
+      }
+      ++uses[base->virt];
+      ++uses[index->virt];
+      // The sum and the shift go (the later first)
+      if (kshl > kadd) {
+        vec_remove_at(irs, kshl);
+        vec_remove_at(irs, kadd);
+      } else {
+        vec_remove_at(irs, kadd);
+        if (kshl >= 0)
+          vec_remove_at(irs, kshl);
+      }
+      j -= 1 + (kshl >= 0);
+    }
+  }
+  free(uses);
+}
+
 void tweak_irs(FuncBackend *fnbe) {
   BBContainer *bbcon = fnbe->bbcon;
   RegAlloc *ra = fnbe->ra;
+  fuse_indexed_access(ra, bbcon);  // FPC
   for (int i = 0; i < bbcon->len; ++i) {
     BB *bb = bbcon->data[i];
     Vector *irs = bb->irs;

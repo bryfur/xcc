@@ -258,6 +258,55 @@ static void gen_case(Stmt *stmt, bool is_last) {
   gen_stmt(stmt->case_.stmt, is_last);
 }
 
+// FPC: a loop condition cheap and free of side effects enough to be
+// evaluated at the bottom of the loop too (loop rotation: a br_if per
+// iteration instead of a br_if and a br)
+static int rotatable_cond_cost(Expr *e) {
+  if (e->type != NULL && (e->type->qualifier & TQ_VOLATILE))
+    return 1000;
+  switch (e->kind) {
+  case EX_FIXNUM:
+  case EX_VAR:
+    return 1;
+  case EX_ADD: case EX_SUB: case EX_MUL: case EX_BITAND: case EX_BITOR: case EX_BITXOR:
+  case EX_LSHIFT: case EX_RSHIFT: case EX_EQ: case EX_NE: case EX_LT: case EX_LE:
+  case EX_GE: case EX_GT: case EX_LOGAND: case EX_LOGIOR:
+    return 1 + rotatable_cond_cost(e->bop.lhs) + rotatable_cond_cost(e->bop.rhs);
+  case EX_POS: case EX_NEG: case EX_BITNOT: case EX_CAST: case EX_DEREF:
+    return 1 + rotatable_cond_cost(e->unary.sub);
+  case EX_MEMBER:
+    return 1 + rotatable_cond_cost(e->member.target);
+  default:
+    return 1000;
+  }
+}
+
+// block; if (!cond) br 0; loop; block; <body> end; <post>; if (cond) br 0; end; end
+static void gen_rotated_loop(Expr *cond, Stmt *body, Expr *post) {
+  int save_break = break_depth;
+  int save_continue = continue_depth;
+  break_depth = cur_depth;
+  continue_depth = cur_depth + 2;
+
+  ADD_CODE(OP_BLOCK, WT_VOID); {
+    ++cur_depth;
+    gen_cond_jmp(cond, false, 0);
+    ADD_CODE(OP_LOOP, WT_VOID); {
+      ADD_CODE(OP_BLOCK, WT_VOID); {
+        cur_depth += 2;
+        gen_stmt(body, false);
+      } ADD_CODE(OP_END);
+      --cur_depth;
+      if (post != NULL)
+        gen_expr_stmt(post);
+      gen_cond_jmp(cond, true, 0);
+    } ADD_CODE(OP_END);
+  } ADD_CODE(OP_END);
+  cur_depth -= 2;
+  break_depth = save_break;
+  continue_depth = save_continue;
+}
+
 static void gen_while(Stmt *stmt) {
   bool infinite_loop = false;
   Expr *cond = stmt->while_.cond;
@@ -265,6 +314,11 @@ static void gen_while(Stmt *stmt) {
     if (!is_const_truthy(cond))
       return;
     infinite_loop = true;
+  }
+
+  if (!infinite_loop && rotatable_cond_cost(cond) <= 8) {  // FPC
+    gen_rotated_loop(cond, stmt->while_.body, NULL);
+    return;
   }
 
   int save_break = break_depth;
@@ -333,6 +387,11 @@ static void gen_for(Stmt *stmt) {
     if (!is_const_truthy(cond))
       return;
     infinite_loop = true;
+  }
+
+  if (!infinite_loop && rotatable_cond_cost(cond) <= 8) {  // FPC
+    gen_rotated_loop(cond, stmt->for_.body, stmt->for_.post);
+    return;
   }
 
   int save_break = break_depth;

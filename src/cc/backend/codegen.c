@@ -654,6 +654,33 @@ static inline void gen_case(Stmt *stmt) {
   gen_stmt(stmt->case_.stmt);
 }
 
+// FPC: a loop condition cheap and free of side effects enough to be
+// evaluated at the bottom of the loop too (loop rotation: one branch per
+// iteration instead of two)
+static int rotatable_cond_cost(Expr *e) {
+  if (e->type != NULL && (e->type->qualifier & TQ_VOLATILE))
+    return 1000;
+  switch (e->kind) {
+  case EX_FIXNUM:
+  case EX_VAR:
+    return 1;
+  case EX_ADD: case EX_SUB: case EX_MUL: case EX_BITAND: case EX_BITOR: case EX_BITXOR:
+  case EX_LSHIFT: case EX_RSHIFT: case EX_EQ: case EX_NE: case EX_LT: case EX_LE:
+  case EX_GE: case EX_GT: case EX_LOGAND: case EX_LOGIOR:
+    return 1 + rotatable_cond_cost(e->bop.lhs) + rotatable_cond_cost(e->bop.rhs);
+  case EX_POS: case EX_NEG: case EX_BITNOT: case EX_CAST: case EX_DEREF:
+    return 1 + rotatable_cond_cost(e->unary.sub);
+  case EX_MEMBER:
+    return 1 + rotatable_cond_cost(e->member.target);
+  default:
+    return 1000;
+  }
+}
+
+static bool rotatable_cond(Expr *cond) {
+  return cond != NULL && rotatable_cond_cost(cond) <= 8;
+}
+
 static void gen_while(Stmt *stmt) {
   // cond_at_top (default, or builtin-expect=true)
   // cond:
@@ -688,7 +715,12 @@ static void gen_while(Stmt *stmt) {
     cond = value;
   }
 
-  if (cond_at_top) {
+  bool rotate = cond_at_top && rotatable_cond(cond);  // FPC
+  if (rotate) {
+    // if (!<cond>) goto next; loop: <body>; cond: if (<cond>) goto loop; next:
+    gen_cond_jmp(cond, loop_bb, next_bb);
+    set_curbb(loop_bb);
+  } else if (cond_at_top) {
     set_curbb(cond_bb);
     gen_cond_jmp(cond, loop_bb, next_bb);
     set_curbb(loop_bb);
@@ -699,7 +731,10 @@ static void gen_while(Stmt *stmt) {
 
   gen_stmt(stmt->while_.body);
 
-  if (cond_at_top) {
+  if (rotate) {
+    set_curbb(cond_bb);
+    gen_cond_jmp(cond, loop_bb, next_bb);
+  } else if (cond_at_top) {
     new_ir_jmp(cond_bb);
   } else {
     set_curbb(cond_bb);
@@ -811,7 +846,11 @@ static void gen_for(Stmt *stmt) {
     cond = value;
   }
 
-  if (cond_at_top) {
+  bool rotate = cond_at_top && rotatable_cond(cond);  // FPC
+  if (rotate) {
+    gen_cond_jmp(cond, loop_bb, next_bb);
+    set_curbb(loop_bb);
+  } else if (cond_at_top) {
     set_curbb(cond_bb);
     if (cond != NULL)
       gen_cond_jmp(cond, loop_bb, next_bb);
@@ -827,7 +866,10 @@ static void gen_for(Stmt *stmt) {
   if (stmt->for_.post != NULL)
     gen_expr_stmt(stmt->for_.post);
 
-  if (cond_at_top) {
+  if (rotate) {
+    set_curbb(cond_bb);
+    gen_cond_jmp(cond, loop_bb, next_bb);
+  } else if (cond_at_top) {
     new_ir_jmp(cond_bb);
   } else {
     set_curbb(cond_bb);

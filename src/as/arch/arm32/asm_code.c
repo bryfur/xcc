@@ -342,6 +342,18 @@ static bool asm_ldst(Inst *inst, ParseInfo *parser, Code *code) {
     int sh = o[1].indirect.shift;
     if (sh < 0 || sh > 3)
       return asm_error(parser, "shift out of range");
+    if (sh == 0 && low(rt) && low(rn) && low(rm) && inst->width != 4) {  // 16-bit T1
+      static const struct { int op; uint16_t code; } k16[] = {
+        {STR, 0x5000}, {STRH, 0x5200}, {STRB, 0x5400}, {LDRSB, 0x5600},
+        {LDR, 0x5800}, {LDRH, 0x5a00}, {LDRB, 0x5c00}, {LDRSH, 0x5e00},
+      };
+      for (size_t i = 0; i < sizeof(k16) / sizeof(k16[0]); ++i) {
+        if (k16[i].op == (int)inst->op) {
+          put16(code, k16[i].code | (rm << 6) | (rn << 3) | rt);
+          return true;
+        }
+      }
+    }
     put32(code, t4 | rn, (rt << 12) | (sh << 4) | rm);
     return true;
   }

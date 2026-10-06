@@ -201,7 +201,7 @@ bool immediate(const char **pp, int64_t *value) {
     }
   }
   const char *q = p;
-  unsigned long val = strtoul(p, (char**)&p, base);
+  unsigned long long val = strtoull(p, (char**)&p, base);  // FPC: was strtoul (32-bit where long is)
   if (p == q)
     return false;
 

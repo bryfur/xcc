@@ -554,6 +554,18 @@ static int insert_load_store_spilled_irs(RegAlloc *ra, BBContainer *bbcon) {
         j = insert_tmp_reg(ra, irs, j, ir->dst);
         ++inserted;
       }
+
+      // FPC: a store's index (ARM32's indexed stores)
+      if (ir->kind == IR_STORE && ir->additional_operands != NULL) {
+        Vector *additional = ir->additional_operands;
+        for (int k = 0; k < additional->len; ++k) {
+          VReg *vreg = additional->data[k];
+          if (vreg != NULL && !(vreg->flag & VRF_CONST) && (vreg->flag & VRF_SPILLED)) {
+            j = insert_tmp_reg(ra, irs, j, vreg);
+            ++inserted;
+          }
+        }
+      }
     }
   }
   return inserted;

@@ -12,6 +12,10 @@
 #include "parse_asm.h"
 #include "util.h"
 
+// The generic parser's opcode table (unused: arm32_parse_inst parses the
+// mnemonics), for the linker when the dead code it is in stays
+const char *kRawOpTable[] = {NULL};
+
 typedef struct {
   const char *name;
   enum Opcode op;

@@ -943,14 +943,106 @@ static void gen_expect(Expr *expr, bool needval) {
   gen_expr(expr->bop.lhs, needval);
 }
 
+// FPC: how many low bits of an i32 value can be set (32: any, the value
+// may be negative too), from what the expression is made of: a narrowing
+// cast need not mask a value already narrow enough (`(uint16_t)(crc ^ 0x4002)`
+// with crc a uint16_t).  xcc keeps narrow values zero- or sign-extended
+// to 32 bits (loads, casts), which this relies on.
+static int known_bits(const Expr *e) {
+  const Type *type = e->type;
+  if (type == NULL || !(type->kind == TY_FIXNUM || type->kind == TY_PTR) ||
+      type_size(type) > I32_SIZE)
+    return 32;
+  int size = type_size(type);
+  int by_type = size < I32_SIZE && is_unsigned(type) ? size * TARGET_CHAR_BIT : 32;
+  int a, b;
+  switch (e->kind) {
+  case EX_FIXNUM:
+    {
+      if (e->fixnum < 0)
+        return 32;
+      uint64_t v = e->fixnum;
+      int n = 0;
+      while (v != 0 && n < 32) {
+        ++n;
+        v >>= 1;
+      }
+      return n;
+    }
+  case EX_CAST:
+    {
+      const Expr *sub = e->unary.sub;
+      if (sub->type->kind != TY_FIXNUM || type_size(sub->type) > I32_SIZE)
+        return by_type;
+      a = known_bits(sub);
+      if (size < I32_SIZE) {
+        int d = size * TARGET_CHAR_BIT;
+        if (is_unsigned(type))
+          return a < d ? a : d;
+        return a < d ? a : 32;
+      }
+      return a;
+    }
+  case EX_BITAND:
+    a = known_bits(e->bop.lhs);
+    b = known_bits(e->bop.rhs);
+    return a < b ? a : b;
+  case EX_BITOR: case EX_BITXOR:
+    a = known_bits(e->bop.lhs);
+    b = known_bits(e->bop.rhs);
+    return a > b ? a : b;
+  case EX_ADD:
+    a = known_bits(e->bop.lhs);
+    b = known_bits(e->bop.rhs);
+    a = (a > b ? a : b) + 1;
+    return a < 32 ? a : 32;
+  case EX_MUL:
+    a = known_bits(e->bop.lhs) + known_bits(e->bop.rhs);
+    return a < 32 ? a : 32;
+  case EX_RSHIFT:
+    if (e->bop.rhs->kind == EX_FIXNUM && e->bop.rhs->fixnum >= 0 && e->bop.rhs->fixnum < 32) {
+      a = known_bits(e->bop.lhs);
+      if (a == 32 && !is_unsigned(type))
+        return 32;
+      a -= e->bop.rhs->fixnum;
+      return a > 0 ? a : 0;
+    }
+    return by_type;
+  case EX_LSHIFT:
+    if (e->bop.rhs->kind == EX_FIXNUM && e->bop.rhs->fixnum >= 0 && e->bop.rhs->fixnum < 32) {
+      a = known_bits(e->bop.lhs) + e->bop.rhs->fixnum;
+      return a < 32 ? a : 32;
+    }
+    return by_type;
+  case EX_EQ: case EX_NE: case EX_LT: case EX_LE: case EX_GE: case EX_GT:
+  case EX_LOGAND: case EX_LOGIOR:
+    return 1;
+  case EX_TERNARY:
+    a = known_bits(e->ternary.tval);
+    b = known_bits(e->ternary.fval);
+    return a > b ? a : b;
+  default:
+    return by_type;
+  }
+}
+
 static void gen_cast(Expr *expr, bool needval) {
   Expr *src = expr->unary.sub;
   Type *dst_type = expr->type;
   assert(!is_bool(dst_type));  // bool is handled in parse phase.
 
   gen_expr(src, needval);
-  if (needval)
+  if (needval) {
+    // FPC: between 32-bit-or-narrower integers, no code when the value fits
+    if (dst_type->kind == TY_FIXNUM && src->type->kind == TY_FIXNUM &&
+        type_size(dst_type) < I32_SIZE && type_size(src->type) <= I32_SIZE) {
+      int d = type_size(dst_type) * TARGET_CHAR_BIT;
+      int k = known_bits(src);
+      if (is_unsigned(dst_type) ? k <= d : k < d)
+        return;
+    }
     gen_cast_to(dst_type, src->type);
+  }
 }
 
 static void gen_ref(Expr *expr, bool needval) {

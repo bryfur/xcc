@@ -166,10 +166,13 @@ typedef struct IR {
     struct {
       int64_t offset;
       bool unaligned;  // FPC: VRF_UNALIGNED address
+      int index_shift;  // FPC: [opr1 + (opr2 << index_shift)] when opr2 (ARM32)
     } load;
     struct {
       int64_t offset;
       bool unaligned;  // FPC: VRF_UNALIGNED address
+      int index_shift;  // FPC: [opr2 + (index << index_shift)], the index the
+                        // additional operand (ARM32)
     } store;
     struct {
       enum ConditionKind kind;

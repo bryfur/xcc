@@ -75,7 +75,7 @@ char *num(int64_t x) {
 }
 
 char *hexnum(int64_t x) {
-  return fmt("0x%" PRIxPTR, x);
+  return fmt("0x%" PRIx64, x);  // FPC: was PRIxPTR (wrong where pointers are 32-bit)
 }
 
 #ifndef __NO_FLONUM

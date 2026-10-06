@@ -876,15 +876,98 @@ bool check_funcend_return(Stmt *stmt) {
 
 //
 
+// FPC: the size of a function body (its nodes), up to `limit`
+static int expr_size(const Expr *e, int limit);
+
+static int stmt_size(const Stmt *s, int limit) {
+  if (s == NULL || limit <= 0)
+    return 0;
+  int n = 1;
+  switch (s->kind) {
+  case ST_EXPR: n += expr_size(s->expr, limit - n); break;
+  case ST_BLOCK:
+    for (int i = 0; i < s->block.stmts->len && n <= limit; ++i)
+      n += stmt_size(s->block.stmts->data[i], limit - n);
+    break;
+  case ST_IF:
+    n += expr_size(s->if_.cond, limit - n);
+    n += stmt_size(s->if_.tblock, limit - n);
+    n += stmt_size(s->if_.fblock, limit - n);
+    break;
+  case ST_WHILE: case ST_DO_WHILE:
+    n += expr_size(s->while_.cond, limit - n);
+    n += stmt_size(s->while_.body, limit - n);
+    break;
+  case ST_FOR:
+    n += expr_size(s->for_.pre, limit - n);
+    n += expr_size(s->for_.cond, limit - n);
+    n += expr_size(s->for_.post, limit - n);
+    n += stmt_size(s->for_.body, limit - n);
+    break;
+  case ST_RETURN: n += expr_size(s->return_.val, limit - n); break;
+  case ST_VARDECL: n += 1 + stmt_size(s->vardecl->init_stmt, limit - n); break;
+  case ST_EMPTY: case ST_BREAK: case ST_CONTINUE: break;
+  default: n += limit; break;  // switch, goto, asm...: not inlined
+  }
+  return n;
+}
+
+static int expr_size(const Expr *e, int limit) {
+  if (e == NULL || limit <= 0)
+    return 0;
+  int n = 1;
+  switch (e->kind) {
+  case EX_FIXNUM: case EX_FLONUM: case EX_VAR: break;
+  case EX_ADD: case EX_SUB: case EX_MUL: case EX_DIV: case EX_MOD: case EX_BITAND:
+  case EX_BITOR: case EX_BITXOR: case EX_LSHIFT: case EX_RSHIFT: case EX_EQ: case EX_NE:
+  case EX_LT: case EX_LE: case EX_GE: case EX_GT: case EX_LOGAND: case EX_LOGIOR:
+  case EX_ASSIGN: case EX_COMMA:
+    n += expr_size(e->bop.lhs, limit - n);
+    n += expr_size(e->bop.rhs, limit - n);
+    break;
+  case EX_POS: case EX_NEG: case EX_BITNOT: case EX_PREINC: case EX_PREDEC: case EX_POSTINC:
+  case EX_POSTDEC: case EX_REF: case EX_DEREF: case EX_CAST:
+    n += expr_size(e->unary.sub, limit - n);
+    break;
+  case EX_TERNARY:
+    n += expr_size(e->ternary.cond, limit - n);
+    n += expr_size(e->ternary.tval, limit - n);
+    n += expr_size(e->ternary.fval, limit - n);
+    break;
+  case EX_MEMBER: n += expr_size(e->member.target, limit - n); break;
+  case EX_FUNCALL:
+    n += 4 + expr_size(e->funcall.func, limit - n);
+    for (int i = 0; i < e->funcall.args->len && n <= limit; ++i)
+      n += expr_size(e->funcall.args->data[i], limit - n);
+    break;
+  default: n += limit; break;  // strings, compound literals, blocks, inlined calls
+  }
+  return n;
+}
+
+#ifndef AUTO_INLINE_SIZE
+#define AUTO_INLINE_SIZE  24
+#endif
+
 bool satisfy_inline_criteria(const VarInfo *varinfo) {
-  // TODO: Check complexity or length of function body statements.
   const Type *type = varinfo->type;
-  if (type->kind == TY_FUNC && (varinfo->storage & VS_INLINE) && !type->func.vaargs) {
+  if (type->kind == TY_FUNC && !type->func.vaargs) {
     Function *func = varinfo->global.func;
     if (func != NULL) {
       // Self-recursion or mutual recursion are prevented,
       // because some inline function must not be defined at funcall point.
-      return func->body_block != NULL && func->label_table == NULL;
+      if (func->body_block == NULL || func->label_table != NULL)
+        return false;
+      if (varinfo->storage & VS_INLINE)
+        return true;
+      // FPC: a small function defined before the call is inlined too
+      // (not a weak one, nor one with static variables)
+      return type->func.params != NULL &&
+             (func->static_vars == NULL || func->static_vars->len == 0) &&
+             (func->attributes == NULL ||
+              (!table_try_get(func->attributes, alloc_cname("weak"), NULL) &&
+               !table_try_get(func->attributes, alloc_cname("noinline"), NULL))) &&
+             stmt_size(func->body_block, AUTO_INLINE_SIZE + 1) <= AUTO_INLINE_SIZE;
     }
   }
   return false;

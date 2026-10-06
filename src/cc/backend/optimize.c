@@ -711,6 +711,483 @@ static void copy_propagation(RegAlloc *ra, BBContainer *bbcon) {
   } while (again);
 }
 
+// FPC: move coalescing on the non-SSA IR, before register allocation.
+//
+//   (A)  t = OP ...; v = MOV t        ->  v = OP ...      (t used only there)
+//   (B)  t = MOV v; ... X t ...       ->  ... X v ...     (t defined and used once,
+//                                                          in the same block, v unchanged)
+//
+// What a loop counter's `i++` and an expression assigned to a variable
+// leave: a temporary and a register-to-register move each.
+
+static void count_vreg_uses(BBContainer *bbcon, int *uses, int *defs) {
+  for (int i = 0; i < bbcon->len; ++i) {
+    BB *bb = bbcon->data[i];
+    if (bb->phis != NULL) {
+      for (int j = 0; j < bb->phis->len; ++j) {
+        Phi *phi = bb->phis->data[j];
+        ++defs[phi->dst->virt];
+        for (int k = 0; k < phi->params->len; ++k) {
+          VReg *vreg = phi->params->data[k];
+          if (!(vreg->flag & VRF_CONST))
+            ++uses[vreg->virt];
+        }
+      }
+    }
+    for (int j = 0; j < bb->irs->len; ++j) {
+      IR *ir = bb->irs->data[j];
+      VReg *operands[] = {ir->opr1, ir->opr2};
+      const int N = ARRAY_SIZE(operands);
+      int n = N;
+      Vector *additional = ir->additional_operands;
+      if (additional != NULL)
+        n += additional->len;
+      for (int k = 0; k < n; ++k) {
+        VReg *vreg = k < N ? operands[k] : additional->data[k - N];
+        if (vreg != NULL && !(vreg->flag & VRF_CONST))
+          ++uses[vreg->virt];
+      }
+      if (ir->dst != NULL && !(ir->dst->flag & VRF_CONST))
+        ++defs[ir->dst->virt];
+    }
+  }
+}
+
+static bool coalescable(VReg *t, VReg *v) {
+  const int NG = VRF_CONST | VRF_PARAM | VRF_STACK_PARAM | VRF_FORCEMEMORY | VRF_VOLATILEREG |
+                 VRF_NO_SPILL;
+  return t != v && !(t->flag & NG) && !(v->flag & NG) && t->vsize == v->vsize &&
+         (t->flag & (VRF_MASK | VRF_UNALIGNED)) == (v->flag & (VRF_MASK | VRF_UNALIGNED));
+}
+
+static bool ir_reads(IR *ir, VReg *v) {
+  if (ir->opr1 == v || ir->opr2 == v)
+    return true;
+  Vector *additional = ir->additional_operands;
+  if (additional != NULL) {
+    for (int k = 0; k < additional->len; ++k) {
+      if (additional->data[k] == v)
+        return true;
+    }
+  }
+  return false;
+}
+
+static void coalesce_moves(RegAlloc *ra, BBContainer *bbcon) {
+  int vreg_count = ra->vregs->len;
+  int *uses = malloc_or_die(sizeof(*uses) * vreg_count * 2);
+  int *defs = uses + vreg_count;
+  for (int pass = 0; pass < 4; ++pass) {
+    for (int i = 0; i < vreg_count * 2; ++i)
+      uses[i] = 0;
+    count_vreg_uses(bbcon, uses, defs);
+    bool changed = false;
+    for (int ibb = 0; ibb < bbcon->len; ++ibb) {
+      BB *bb = bbcon->data[ibb];
+      Vector *irs = bb->irs;
+      for (int j = 0; j + 1 < irs->len; ++j) {
+        IR *ir = irs->data[j];
+        IR *next = irs->data[j + 1];
+        VReg *t = ir->dst;
+        if (t == NULL || next->kind != IR_MOV || next->opr1 != t)
+          continue;
+        switch (ir->kind) {
+        case IR_ADD: case IR_SUB: case IR_MUL: case IR_DIV: case IR_MOD:
+        case IR_BITAND: case IR_BITOR: case IR_BITXOR: case IR_LSHIFT: case IR_RSHIFT:
+        case IR_COND: case IR_NEG: case IR_BITNOT: case IR_CAST: case IR_MOV:
+        case IR_LOAD: case IR_BOFS: case IR_IOFS:
+          break;
+        default:
+          continue;
+        }
+        if (uses[t->virt] != 1 || defs[t->virt] != 1 || !coalescable(t, next->dst))
+          continue;
+        ir->dst = next->dst;
+        vec_remove_at(irs, j + 1);
+        --uses[t->virt];
+        --defs[t->virt];
+        changed = true;
+      }
+
+      for (int j = 0; j < irs->len; ++j) {
+        IR *ir = irs->data[j];
+        VReg *t = ir->dst, *v = ir->opr1;
+        if (t == NULL || v == NULL || uses[t->virt] != 1 || defs[t->virt] != 1)
+          continue;
+        if (ir->kind != IR_MOV &&
+            !(ir->kind == IR_CAST && t->vsize == v->vsize &&
+              !((t->flag | v->flag) & VRF_FLONUM)))
+          continue;
+        // Only the signedness differs (a cast): fine where it doesn't matter
+        bool signonly = false;
+        if (!coalescable(t, v)) {
+          int f = t->flag ^ v->flag;
+          v->flag ^= f & VRF_UNSIGNED;
+          signonly = coalescable(t, v);
+          v->flag ^= f & VRF_UNSIGNED;
+          if (!signonly)
+            continue;
+        }
+        for (int k = j + 1; k < irs->len; ++k) {
+          IR *use = irs->data[k];
+          if (ir_reads(use, t)) {
+            if (signonly) {
+              switch (use->kind) {
+              case IR_ADD: case IR_SUB: case IR_MUL: case IR_BITAND: case IR_BITOR:
+              case IR_BITXOR: case IR_LSHIFT:
+                if (use->dst != NULL && use->dst->vsize == t->vsize)
+                  break;
+                goto next_mov;
+              case IR_LOAD: case IR_STORE:
+                break;
+              default:
+                goto next_mov;
+              }
+            }
+            if (use->opr1 == t)
+              use->opr1 = v;
+            if (use->opr2 == t)
+              use->opr2 = v;
+            Vector *additional = use->additional_operands;
+            if (additional != NULL) {
+              for (int m = 0; m < additional->len; ++m) {
+                if (additional->data[m] == t)
+                  additional->data[m] = v;
+              }
+            }
+            vec_remove_at(irs, j);
+            --j;
+            changed = true;
+            break;
+          }
+          if (use->dst == v || use->kind == IR_ASM)
+            break;
+        }
+      next_mov:;
+      }
+    }
+    if (!changed)
+      break;
+  }
+  free(uses);
+}
+
+// FPC: a conditional jump on a register given a constant earlier in the same
+// block (a loop's first test after its counter's initialization, `while (1)`
+// through a variable...) decided at compile time.
+static bool fold_known_jumps(RegAlloc *ra, BBContainer *bbcon) {
+  int vreg_count = ra->vregs->len;
+  VReg **known = calloc_or_die(sizeof(*known) * vreg_count);
+  bool changed = false;
+  for (int ibb = 0; ibb < bbcon->len; ++ibb) {
+    BB *bb = bbcon->data[ibb];
+    Vector *irs = bb->irs;
+    for (int j = 0; j < irs->len; ++j) {
+      IR *ir = irs->data[j];
+      if (ir->kind == IR_JMP && ir->jmp.cond != COND_ANY && ir->jmp.cond != COND_NONE &&
+          ir->opr1 != NULL && ir->opr2 != NULL) {
+        VReg *a = ir->opr1, *b = ir->opr2;
+        if (!(a->flag & VRF_CONST) && known[a->virt] != NULL)
+          a = known[a->virt];
+        if (!(b->flag & VRF_CONST) && known[b->virt] != NULL)
+          b = known[b->virt];
+        if ((a->flag & VRF_CONST) && (b->flag & VRF_CONST) &&
+            !((a->flag | b->flag) & VRF_FLONUM)) {
+          // (The comparison is signed or not as its first operand is)
+          bool taken = calc_const_cond(ir->jmp.cond, a, b);
+          if (taken) {
+            ir->jmp.cond = COND_ANY;
+            ir->opr1 = ir->opr2 = NULL;
+          } else {
+            vec_remove_at(irs, j);
+            --j;
+          }
+          changed = true;
+          continue;
+        }
+      }
+      VReg *dst = ir->dst;
+      if (dst == NULL || (dst->flag & VRF_CONST))
+        continue;
+      if (ir->kind == IR_MOV && (ir->opr1->flag & VRF_CONST) &&
+          !(dst->flag & (VRF_FORCEMEMORY | VRF_VOLATILEREG | VRF_FLONUM)) &&
+          ir->opr1->vsize == dst->vsize && (ir->opr1->flag & VRF_UNSIGNED) == (dst->flag & VRF_UNSIGNED))
+        known[dst->virt] = ir->opr1;
+      else
+        known[dst->virt] = NULL;
+    }
+    // Only within the block
+    for (int j = 0; j < irs->len; ++j) {
+      IR *ir = irs->data[j];
+      if (ir->dst != NULL && !(ir->dst->flag & VRF_CONST))
+        known[ir->dst->virt] = NULL;
+    }
+  }
+  free(known);
+  return changed;
+}
+
+// FPC: common subexpressions within a block: a pure integer computation
+// (an address of a global, a row offset...) made again from the same
+// operands gives way to the first one's result (both temporaries).
+static bool same_operand(VReg *a, VReg *b) {
+  if (a == b)
+    return true;
+  if (a == NULL || b == NULL)
+    return false;
+  return (a->flag & VRF_CONST) && (b->flag & VRF_CONST) && !((a->flag | b->flag) & VRF_FLONUM) &&
+         a->fixnum == b->fixnum && a->vsize == b->vsize &&
+         (a->flag & VRF_MASK) == (b->flag & VRF_MASK);
+}
+
+static bool cse_kind(IR *ir) {
+  switch (ir->kind) {
+  case IR_IOFS: case IR_BOFS:
+  case IR_ADD: case IR_SUB: case IR_MUL: case IR_BITAND: case IR_BITOR: case IR_BITXOR:
+  case IR_LSHIFT: case IR_RSHIFT: case IR_NEG: case IR_BITNOT: case IR_CAST:
+    return ir->additional_operands == NULL;
+  default:
+    return false;
+  }
+}
+
+static bool same_expr(IR *a, IR *b) {
+  if (a->kind != b->kind || a->dst->vsize != b->dst->vsize ||
+      (a->dst->flag & (VRF_MASK | VRF_UNALIGNED)) != (b->dst->flag & (VRF_MASK | VRF_UNALIGNED)) ||
+      !same_operand(a->opr1, b->opr1) || !same_operand(a->opr2, b->opr2))
+    return false;
+  switch (a->kind) {
+  case IR_IOFS:
+    return equal_name(a->iofs.label, b->iofs.label) && a->iofs.offset == b->iofs.offset &&
+           a->iofs.global == b->iofs.global;
+  case IR_BOFS:
+    return a->bofs.frameinfo == b->bofs.frameinfo && a->bofs.offset == b->bofs.offset;
+  default:
+    return true;
+  }
+}
+
+static VReg *cse_subst(VReg **repl, VReg *v) {
+  while (v != NULL && !(v->flag & VRF_CONST) && repl[v->virt] != NULL)
+    v = repl[v->virt];
+  return v;
+}
+
+static void local_cse(RegAlloc *ra, BBContainer *bbcon) {
+  int vreg_count = ra->vregs->len;
+  int *uses = malloc_or_die(sizeof(*uses) * vreg_count * 2);
+  int *defs = uses + vreg_count;
+  for (int i = 0; i < vreg_count * 2; ++i)
+    uses[i] = 0;
+  count_vreg_uses(bbcon, uses, defs);
+  VReg **repl = calloc_or_die(sizeof(*repl) * vreg_count);
+  const int NG = VRF_CONST | VRF_PARAM | VRF_STACK_PARAM | VRF_FORCEMEMORY | VRF_VOLATILEREG |
+                 VRF_FLONUM | VRF_NO_SPILL;
+  bool any = false;
+  Vector avail;
+  vec_init(&avail);
+  for (int ibb = 0; ibb < bbcon->len; ++ibb) {
+    BB *bb = bbcon->data[ibb];
+    Vector *irs = bb->irs;
+    vec_clear(&avail);
+    for (int j = 0; j < irs->len; ++j) {
+      IR *ir = irs->data[j];
+      if (any) {
+        ir->opr1 = cse_subst(repl, ir->opr1);
+        ir->opr2 = cse_subst(repl, ir->opr2);
+      }
+      VReg *dst = ir->dst;
+      if (dst != NULL && cse_kind(ir) && !(dst->flag & NG) && defs[dst->virt] == 1 &&
+          !((ir->opr1 != NULL && (ir->opr1->flag & VRF_FLONUM)) ||
+            (ir->opr2 != NULL && (ir->opr2->flag & VRF_FLONUM)))) {
+        int k;
+        for (k = 0; k < avail.len; ++k) {
+          if (same_expr(avail.data[k], ir))
+            break;
+        }
+        if (k < avail.len) {
+          repl[dst->virt] = ((IR*)avail.data[k])->dst;
+          vec_remove_at(irs, j);
+          --j;
+          any = true;
+          continue;
+        }
+        vec_push(&avail, ir);
+        continue;
+      }
+      if (dst != NULL && !(dst->flag & VRF_CONST)) {
+        for (int k = 0; k < avail.len; ++k) {
+          IR *a = avail.data[k];
+          if (a->opr1 == dst || a->opr2 == dst || a->dst == dst) {
+            vec_remove_at(&avail, k);
+            --k;
+          }
+        }
+      }
+    }
+  }
+  if (any) {
+    for (int ibb = 0; ibb < bbcon->len; ++ibb) {
+      BB *bb = bbcon->data[ibb];
+      if (bb->phis != NULL) {
+        for (int j = 0; j < bb->phis->len; ++j) {
+          Phi *phi = bb->phis->data[j];
+          for (int k = 0; k < phi->params->len; ++k)
+            phi->params->data[k] = cse_subst(repl, phi->params->data[k]);
+        }
+      }
+      for (int j = 0; j < bb->irs->len; ++j) {
+        IR *ir = bb->irs->data[j];
+        ir->opr1 = cse_subst(repl, ir->opr1);
+        ir->opr2 = cse_subst(repl, ir->opr2);
+        Vector *additional = ir->additional_operands;
+        if (additional != NULL) {
+          for (int k = 0; k < additional->len; ++k)
+            additional->data[k] = cse_subst(repl, additional->data[k]);
+        }
+        if (ir->kind == IR_CALL) {
+          for (int k = 0; k < ir->call->total_arg_count; ++k)
+            ir->call->args[k] = cse_subst(repl, ir->call->args[k]);
+        }
+      }
+    }
+  }
+  free(repl);
+  free(uses);
+}
+
+// FPC: loop-invariant code motion.  A loop is a backward jump's range of
+// blocks (xcc lays loops out contiguously), entered only at its head, from
+// the block before it.  A computation in it that can't trap, whose operands
+// are not changed in the loop and whose result is a temporary assigned only
+// there moves to that block (an address of a global, a constant, the row
+// offset of an array access...).
+static int bb_index(BBContainer *bbcon, BB *bb) {
+  for (int i = 0; i < bbcon->len; ++i) {
+    if (bbcon->data[i] == bb)
+      return i;
+  }
+  return -1;
+}
+
+static bool bb_falls_through(BB *bb) {
+  if (bb->irs->len == 0)
+    return true;
+  IR *ir = bb->irs->data[bb->irs->len - 1];
+  return !((ir->kind == IR_JMP && ir->jmp.cond == COND_ANY) || ir->kind == IR_TJMP);
+}
+
+static bool hoistable_kind(IR *ir) {
+  switch (ir->kind) {
+  case IR_IOFS: case IR_BOFS:
+  case IR_ADD: case IR_SUB: case IR_MUL: case IR_BITAND: case IR_BITOR: case IR_BITXOR:
+  case IR_LSHIFT: case IR_RSHIFT: case IR_NEG: case IR_BITNOT: case IR_CAST:
+    return true;
+  default:
+    return false;
+  }
+}
+
+static void hoist_loop_invariants(RegAlloc *ra, BBContainer *bbcon) {
+  int vreg_count = ra->vregs->len;
+  int *uses = malloc_or_die(sizeof(*uses) * vreg_count * 2);
+  int *defs = uses + vreg_count;
+  for (int i = 0; i < vreg_count * 2; ++i)
+    uses[i] = 0;
+  count_vreg_uses(bbcon, uses, defs);
+  unsigned char *inloop = malloc_or_die(vreg_count);
+  const int NG = VRF_CONST | VRF_PARAM | VRF_STACK_PARAM | VRF_FORCEMEMORY | VRF_VOLATILEREG |
+                 VRF_FLONUM | VRF_NO_SPILL;
+
+  for (int j = 0; j < bbcon->len; ++j) {
+    BB *latch = bbcon->data[j];
+    if (latch->irs->len == 0)
+      continue;
+    IR *jmp = latch->irs->data[latch->irs->len - 1];
+    if (jmp->kind != IR_JMP)
+      continue;
+    int h = bb_index(bbcon, jmp->jmp.bb);
+    if (h <= 0 || h > j)
+      continue;
+    BB *pre = bbcon->data[h - 1];
+    if (!bb_falls_through(pre) || pre->next != bbcon->data[h])
+      continue;
+    // Innermost loops only (what moves out of a loop stays in a register
+    // through all of it: the pressure on the registers in outer loops)
+    bool inner = true;
+    for (int k = h; k < j && inner; ++k) {
+      BB *b = bbcon->data[k];
+      if (b->irs->len > 0) {
+        IR *last = b->irs->data[b->irs->len - 1];
+        if (last->kind == IR_JMP) {
+          int t = bb_index(bbcon, last->jmp.bb);
+          if (t >= h && t <= k)
+            inner = false;
+        }
+      }
+    }
+    if (!inner)
+      continue;
+    // Entered only at the head, and only from `pre` and the loop itself
+    bool ok = true;
+    for (int k = h; k <= j && ok; ++k) {
+      Vector *from = ((BB*)bbcon->data[k])->from_bbs;
+      for (int m = 0; m < from->len; ++m) {
+        BB *f = from->data[m];
+        if (k == h && f == pre)
+          continue;
+        int fi = bb_index(bbcon, f);
+        if (fi < h || fi > j) {
+          ok = false;
+          break;
+        }
+      }
+    }
+    if (!ok)
+      continue;
+
+    for (int i = 0; i < vreg_count; ++i)
+      inloop[i] = false;
+    for (int k = h; k <= j; ++k) {
+      Vector *irs = ((BB*)bbcon->data[k])->irs;
+      for (int m = 0; m < irs->len; ++m) {
+        IR *ir = irs->data[m];
+        if (ir->dst != NULL && !(ir->dst->flag & VRF_CONST))
+          inloop[ir->dst->virt] = true;
+      }
+    }
+
+    int at = pre->irs->len;
+    if (at > 0 && ((IR*)pre->irs->data[at - 1])->kind == IR_JMP)
+      --at;
+    for (int k = h; k <= j; ++k) {
+      Vector *irs = ((BB*)bbcon->data[k])->irs;
+      for (int m = 0; m < irs->len; ++m) {
+        IR *ir = irs->data[m];
+        VReg *dst = ir->dst;
+        if (dst == NULL || !hoistable_kind(ir) || (dst->flag & NG) || defs[dst->virt] != 1)
+          continue;
+        VReg *oprs[] = {ir->opr1, ir->opr2};
+        bool inv = ir->additional_operands == NULL;
+        for (int o = 0; o < 2 && inv; ++o) {
+          VReg *opr = oprs[o];
+          if (opr != NULL && (opr->flag & VRF_FLONUM || (!(opr->flag & VRF_CONST) &&
+                                                         (inloop[opr->virt] || (opr->flag & VRF_FORCEMEMORY)))))
+            inv = false;
+        }
+        if (!inv)
+          continue;
+        vec_remove_at(irs, m);
+        --m;
+        vec_insert(pre->irs, at++, ir);
+        inloop[dst->virt] = false;
+      }
+    }
+  }
+  free(inloop);
+  free(uses);
+}
+
 //
 
 void optimize(RegAlloc *ra, BBContainer *bbcon) {
@@ -733,10 +1210,19 @@ void optimize(RegAlloc *ra, BBContainer *bbcon) {
       clear_unused_bbs(bbcon);
 
       remove_unnecessary_bb(bbcon);
+      coalesce_moves(ra, bbcon);  // FPC
     }
   } else {
+    coalesce_moves(ra, bbcon);  // FPC
+    if (fold_known_jumps(ra, bbcon)) {  // FPC
+      detect_from_bbs(bbcon);
+      clear_unused_bbs(bbcon);
+    }
+    local_cse(ra, bbcon);  // FPC
     remove_unused_vregs(ra, bbcon);
     remove_unnecessary_bb(bbcon);
+    detect_from_bbs(bbcon);
+    hoist_loop_invariants(ra, bbcon);  // FPC
   }
   detect_from_bbs(bbcon);
 }
