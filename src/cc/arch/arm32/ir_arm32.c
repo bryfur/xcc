@@ -1659,7 +1659,11 @@ static int vreg_known_bits(Vector *irs, int pos, VReg *v, int depth) {
   return r < by_type ? r : by_type;
 }
 
-static void mark_fitting_casts(BBContainer *bbcon) {
+static void mark_fitting_casts(RegAlloc *ra, BBContainer *bbcon) {
+  int vreg_count = ra->vregs->len;
+  int *uses = malloc_or_die(sizeof(*uses) * vreg_count * 2);
+  int *defs = uses + vreg_count;
+  count_uses_defs(ra, bbcon, uses, defs);
   for (int i = 0; i < bbcon->len; ++i) {
     BB *bb = bbcon->data[i];
     Vector *irs = bb->irs;
@@ -1675,8 +1679,18 @@ static void mark_fitting_casts(BBContainer *bbcon) {
       int d = 8 << dst->vsize;
       int k = vreg_known_bits(irs, j, src, 6);
       ir->cast.fits = (dst->flag & VRF_UNSIGNED) ? k <= d : k < d;
+      // FPC: used only by the next store of its size (which keeps its low
+      // bits only): no extension
+      if (!ir->cast.fits && j + 1 < irs->len && !(dst->flag & (VRF_FORCEMEMORY | VRF_VOLATILEREG)) &&
+          dst->virt < vreg_count && uses[dst->virt] == 1 && defs[dst->virt] == 1) {
+        IR *st = irs->data[j + 1];
+        if (st->kind == IR_STORE && st->opr1 == dst && st->opr2 != dst &&
+            (st->additional_operands == NULL || st->additional_operands->data[0] != dst))
+          ir->cast.fits = true;
+      }
     }
   }
+  free(uses);
 }
 
 // FPC: a multiplication added to (subtracted from) a register: mla (mls);
@@ -1909,5 +1923,5 @@ void tweak_irs(FuncBackend *fnbe) {
     }
   }
   fuse_arm_ops(ra, bbcon);  // FPC
-  mark_fitting_casts(bbcon);  // FPC
+  mark_fitting_casts(ra, bbcon);  // FPC
 }

@@ -934,6 +934,11 @@ static void coalesce_moves(RegAlloc *ra, BBContainer *bbcon) {
                 if (use->opr1 == t && t->vsize != v->vsize)
                   goto next_mov;
                 break;
+              case IR_JMP: case IR_COND:  // FPC: a compare of extended values: their sign
+                if ((t->flag & VRF_UNSIGNED) != (v->flag & VRF_UNSIGNED) ||
+                    (t->flag & VRF_FLONUM) || (v->flag & VRF_FLONUM))
+                  goto next_mov;
+                break;
               default:
                 goto next_mov;
               }
