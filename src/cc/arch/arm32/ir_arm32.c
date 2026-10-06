@@ -1257,11 +1257,66 @@ static bool plain_reg(VReg *v) {
          v->vsize == VRegSize4;
 }
 
+// An address base + constant used by several loads and stores in its block
+// (`p->n++`, `a[2] += x`): the constant in each one's offset
+static void fuse_offset_uses(Vector *irs, int k, int *uses, int *defs) {
+  IR *add = irs->data[k];
+  VReg *a = add->dst, *b = add->opr1;
+  if ((add->kind != IR_ADD && add->kind != IR_SUB) || !plain_reg(a) || !plain_reg(b) ||
+      !(add->opr2->flag & VRF_CONST) || (add->opr2->flag & VRF_FLONUM) || defs[a->virt] != 1 ||
+      uses[a->virt] < 2 || (a->flag & VRF_PARAM) ||
+      (a->flag & VRF_UNALIGNED) != (b->flag & VRF_UNALIGNED) || a == b)
+    return;
+  int found = 0;
+  bool clobbered = false;
+  for (int m = k + 1; m < irs->len && found < uses[a->virt]; ++m) {
+    IR *u = irs->data[m];
+    bool addr = (u->kind == IR_LOAD && u->opr1 == a && u->opr2 == NULL) ||
+                (u->kind == IR_STORE && u->opr2 == a && u->opr1 != a &&
+                 u->additional_operands == NULL);
+    bool other = (u->opr1 == a && !(u->kind == IR_LOAD && addr)) ||
+                 (u->opr2 == a && !(u->kind == IR_STORE && addr));
+    if (u->additional_operands != NULL) {
+      for (int n = 0; n < u->additional_operands->len; ++n)
+        other |= u->additional_operands->data[n] == a;
+    }
+    if (other || (addr && clobbered))
+      return;
+    if (addr)
+      ++found;
+    if (u->dst == b || u->kind == IR_ASM)
+      clobbered = true;
+  }
+  if (found != uses[a->virt])
+    return;
+  int64_t c = add->kind == IR_ADD ? add->opr2->fixnum : -add->opr2->fixnum;
+  for (int m = k + 1, n = 0; n < found; ++m) {
+    IR *u = irs->data[m];
+    if (u->kind == IR_LOAD && u->opr1 == a) {
+      u->opr1 = b;
+      u->load.offset += c;
+      ++n;
+    } else if (u->kind == IR_STORE && u->opr2 == a) {
+      u->opr2 = b;
+      u->store.offset += c;
+      ++n;
+    }
+  }
+  uses[b->virt] += found - 1;
+  uses[a->virt] = 0;
+  vec_remove_at(irs, k);
+}
+
 static void fuse_indexed_access(RegAlloc *ra, BBContainer *bbcon) {
   int vreg_count = ra->vregs->len;
   int *uses = malloc_or_die(sizeof(*uses) * vreg_count * 2);
   int *defs = uses + vreg_count;
   count_uses_defs(ra, bbcon, uses, defs);
+  for (int i = 0; i < bbcon->len; ++i) {
+    Vector *irs = ((BB*)bbcon->data[i])->irs;
+    for (int k = irs->len; --k >= 0; )
+      fuse_offset_uses(irs, k, uses, defs);
+  }
   for (int i = 0; i < bbcon->len; ++i) {
     BB *bb = bbcon->data[i];
     Vector *irs = bb->irs;
