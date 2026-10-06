@@ -184,6 +184,15 @@ typedef struct Token {
 } Token;
 
 Token *alloc_token(enum TokenKind kind, Line *line, const char *begin, const char *end);
+// FPC: tokens given back together (the preprocessor's, line by line)
+typedef struct {
+  void *chunk;
+  size_t used;
+  bool on;
+} TokenPoolMark;
+TokenPoolMark token_pool_enter(bool on);  // on: from the pool till the leave
+void token_pool_leave(TokenPoolMark mark);
+void *token_pool_alloc(size_t size);
 Token *alloc_ident(const Name *name, Line *line, const char *begin, const char *end);
 
 // ================================================

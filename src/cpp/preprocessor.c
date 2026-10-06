@@ -32,6 +32,10 @@ enum Satisfy {
 
 typedef struct PreprocessFile {
   Vector *condstack;
+  // FPC: include guard detection: 0 looking for `#ifndef NAME` first,
+  // 1 inside it, 2 after its `#endif`, -1 not a guarded file
+  int guard_state;
+  const Name *guard;
   Token *tok_lineno;
   Stream stream;
   bool enable;
@@ -46,7 +50,11 @@ static PreprocessFile *curpf;
 #define OUTPUT_COMMENT(...)  do { if (preserve_comment) OUTPUT_PPLINE(__VA_ARGS__); } while (0)
 
 static char *cat_path_cwd(const char *dir, const char *path) {
-  char *cwd = getcwd(NULL, 0);
+  // FPC: the working directory once (getcwd(NULL, 0) allocates PATH_MAX
+  // bytes a call, never freed: 2 MB for the NuttX headers' includes)
+  static char *cwd;
+  if (cwd == NULL)
+    cwd = getcwd(NULL, 0);
   return JOIN_PATHS(cwd, dir, path);
 }
 
@@ -128,7 +136,21 @@ static bool handle_block_comment(const char **pp, Stream *stream) {
   return true;
 }
 
+static void process_line_body(const char *line, Stream *stream);
+
+// FPC: the line's tokens from the pool, given back when it is output
+static int process_line_depth;
+
 static void process_line(const char *line, Stream *stream) {
+  TokenPoolMark m = token_pool_enter(true);
+  ++process_line_depth;
+  process_line_body(line, stream);
+  if (--process_line_depth == 0)
+    macro_reset_hidesets();
+  token_pool_leave(m);
+}
+
+static void process_line_body(const char *line, Stream *stream) {
   set_source_string(line, stream->filename, stream->lineno);
 
   const char *begin = get_lex_p();
@@ -225,6 +247,17 @@ static char *preprocess_one_line(const char *line, Stream *stream, size_t *psize
 
 static Vector sys_inc_paths[INC_ORDERS];  // <const char*>
 static Vector pragma_once_files;  // <const char*>
+// FPC: files wholly inside `#ifndef NAME ... #endif`: not read again while
+// NAME is defined (each was read whole at every include, its lines kept)
+static Vector guarded_files;  // <const char*, const Name*>
+
+static const Name *guard_of(const char *filename) {
+  for (int i = 0; i < guarded_files.len; i += 2) {
+    if (strcmp(guarded_files.data[i], filename) == 0)
+      return guarded_files.data[i + 1];
+  }
+  return NULL;
+}
 
 static const Name *key_file;
 static const Name *key_line;
@@ -358,6 +391,11 @@ static void handle_include(const char *p, Stream *stream, bool is_next) {
 
   if (registered_pragma_once(fn))
     return;
+  {
+    const Name *guard = guard_of(fn);
+    if (guard != NULL && macro_get(guard) != NULL)
+      return;
+  }
 
   FILE *fp = fopen(fn, "r");
   if (fp == NULL) {
@@ -678,6 +716,7 @@ void init_preprocessor(FILE *ofp) {
   // Keep sys_inc_paths.
 
   vec_init(&pragma_once_files);
+  vec_init(&guarded_files);
 
   macro_init();
   init_lexer_for_preprocessor();
@@ -770,7 +809,13 @@ static const char *process_directive(PreprocessFile *ppf, const char *line) {
 
   const char *next;
   // Conditional direcitives are nested even in disabled lines.
-  if (process_conditional_directive(ppf, directive, &next))
+  // FPC: their tokens from the pool, given back after
+  TokenPoolMark m = token_pool_enter(process_line_depth == 0);
+  bool cond = process_conditional_directive(ppf, directive, &next);
+  if (process_line_depth == 0)
+    macro_reset_hidesets();
+  token_pool_leave(m);
+  if (cond)
     return next;
   if (!ppf->enable)
     return NULL;
@@ -833,11 +878,55 @@ const char *get_processed_next_line(void) {
     int ln = snprintf(ppf->linenobuf, sizeof(ppf->linenobuf), "%d", ppf->stream.lineno);
     ppf->tok_lineno->end = ppf->tok_lineno->begin + ln;
 
+    // FPC: include guards
+    if (ppf->guard_state >= 0) {
+      const char *s = skip_whitespaces(line);
+      const char *directive = find_directive(line);
+      if (directive != NULL) {
+        const char *q;
+        if (ppf->guard_state == 0 && ppf->condstack->len == 0 &&
+            (q = keyword(directive, "ifndef")) != NULL) {
+          q = skip_whitespaces(q);
+          const char *e = q;
+          while (isalnum_(*e))
+            ++e;
+          if (e > q && *skip_whitespaces(e) == '\0') {
+            ppf->guard = alloc_name(q, e, true);
+            ppf->guard_state = 1;
+          } else {
+            ppf->guard_state = -1;
+          }
+        } else if (ppf->guard_state == 1 && ppf->condstack->len == 1 &&
+                   keyword(directive, "endif") != NULL) {
+          ppf->guard_state = 2;
+        } else if (ppf->guard_state == 1 && ppf->condstack->len == 1 &&
+                   (keyword(directive, "else") != NULL || keyword(directive, "elif") != NULL)) {
+          ppf->guard_state = -1;  // Something for when the name is defined
+        } else if (ppf->guard_state != 1) {
+          ppf->guard_state = -1;
+        }
+      } else if (*s != '\0' && !(s[0] == '/' && (s[1] == '*' || s[1] == '/')) && s[0] != '*' &&
+                 ppf->guard_state != 1) {
+        ppf->guard_state = -1;  // (a comment's lines start with /*, // or *)
+      }
+    }
+
+    bool was_enabled = ppf->enable;
+    TokenPoolMark pm = token_pool_enter(false);  // FPC: a #define's tokens are kept
     const char *next = process_directive(ppf, line);
+    token_pool_leave(pm);
     if (next != NULL) {
       if (ppf->enable)
         return next;
       process_disabled_line(next, &ppf->stream);
+    }
+
+    // FPC: a line wholly in a disabled region is freed (nothing of it lives
+    // on: no token, no name; an #elif's condition is evaluated: kept)
+    if (!was_enabled && !ppf->enable) {
+      const char *directive = find_directive(line);
+      if (directive == NULL || keyword(directive, "elif") == NULL)
+        free(line);
     }
 
     adjust_output_lineno(ppf);
@@ -850,6 +939,8 @@ void preprocess(FILE *fp, const char *filename) {
 
   PreprocessFile pf;
   pf.condstack = new_vector();
+  pf.guard_state = 0;
+  pf.guard = NULL;
   pf.stream = (Stream){.filename = filename, .fp = fp, .lineno = 0};
   pf.enable = true;
   pf.out_lineno = 0;
@@ -876,6 +967,11 @@ void preprocess(FILE *fp, const char *filename) {
 
   if (pf.condstack->len > 0)
     error("#if not closed");
+
+  if (pf.guard_state == 2 && guard_of(filename) == NULL) {  // FPC
+    vec_push(&guarded_files, filename);
+    vec_push(&guarded_files, pf.guard);
+  }
 
   curpf = oldpf;
   set_pp_stream(old_stream);

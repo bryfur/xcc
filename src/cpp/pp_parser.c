@@ -212,8 +212,11 @@ Vector *pp_funargs(Vector *tokens, int *pindex, int vaarg) {
       }
       if (need_space || (fetched && tok->begin != start)) {
         if (arg->len > 0) {
-          if (tok_space == NULL)
+          if (tok_space == NULL) {
+            TokenPoolMark m = token_pool_enter(false);  // FPC: kept
             tok_space = alloc_token(PPTK_SPACE, NULL, " ", NULL);
+            token_pool_leave(m);
+          }
           vec_push(arg, tok_space);
         }
         need_space = false;

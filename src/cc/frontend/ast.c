@@ -8,12 +8,72 @@
 #include "type.h"
 #include "util.h"
 
+// FPC: a pool for the tokens (and lines) of what the preprocessor outputs
+// as it goes: given back after each line (they were kept, and took most of
+// its memory: 2.4 MB of the 7.6 for NuttX's stdio.h)
+
+#define TOKEN_POOL_CHUNK  (16 * 1024)
+
+typedef struct TokenPoolChunk {
+  struct TokenPoolChunk *next;
+  size_t used;
+} TokenPoolChunk;
+
+#define TPC_HDR  ((sizeof(TokenPoolChunk) + 7) & ~(size_t)7)
+
+static TokenPoolChunk *tp_chunks;  // Newest first
+static TokenPoolChunk *tp_free;
+static bool tp_on;
+
+void *token_pool_alloc(size_t size) {
+  if (!tp_on)
+    return calloc_or_die(size);
+  size = (size + 7) & ~(size_t)7;
+  assert(size <= TOKEN_POOL_CHUNK - TPC_HDR);
+  TokenPoolChunk *c = tp_chunks;
+  if (c == NULL || c->used + size > TOKEN_POOL_CHUNK) {
+    if (tp_free != NULL) {
+      c = tp_free;
+      tp_free = c->next;
+    } else {
+      c = malloc_or_die(TOKEN_POOL_CHUNK);
+    }
+    c->next = tp_chunks;
+    c->used = TPC_HDR;
+    tp_chunks = c;
+  }
+  void *p = (char*)c + c->used;
+  c->used += size;
+  memset(p, 0, size);
+  return p;
+}
+
+TokenPoolMark token_pool_enter(bool on) {
+  TokenPoolMark m = {tp_chunks, tp_chunks != NULL ? tp_chunks->used : 0, tp_on};
+  tp_on = on;
+  return m;
+}
+
+void token_pool_leave(TokenPoolMark m) {
+  if (tp_on) {
+    while (tp_chunks != m.chunk) {
+      TokenPoolChunk *c = tp_chunks;
+      tp_chunks = c->next;
+      c->next = tp_free;
+      tp_free = c;
+    }
+    if (tp_chunks != NULL)
+      tp_chunks->used = m.used;
+  }
+  tp_on = m.on;
+}
+
 Token *alloc_token(enum TokenKind kind, Line *line, const char *begin, const char *end) {
   if (end == NULL) {
     assert(begin != NULL);
     end = begin + strlen(begin);
   }
-  Token *token = calloc_or_die(sizeof(*token));
+  Token *token = token_pool_alloc(sizeof(*token));
   token->kind = kind;
   token->line = line;
   token->begin = begin;

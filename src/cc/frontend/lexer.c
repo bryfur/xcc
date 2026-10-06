@@ -240,7 +240,7 @@ void set_source_file(FILE *fp, const char *filename) {
 }
 
 void set_source_string(const char *line, const char *filename, int lineno) {
-  Line *p = calloc_or_die(sizeof(*p));
+  Line *p = token_pool_alloc(sizeof(*p));  // FPC
   p->filename = filename;
   p->buf = line;
   p->lineno = lineno;

@@ -78,8 +78,23 @@ static void set_token_hideset(const Token *tok, HideSet *hs) {
   }
 }
 
+// FPC: the hide sets are of the tokens of the line being expanded: none is
+// needed once it is output (and the tokens' memory is reused then)
+static Vector hideset_allocs;  // FPC: <HideSet*> each once
+
+void macro_reset_hidesets(void) {
+  vec_clear(&hideset_array);
+  for (int i = 0; i < hideset_allocs.len; ++i) {
+    HideSet *hs = hideset_allocs.data[i];
+    free(hs->entries);
+    free(hs);
+  }
+  vec_clear(&hideset_allocs);
+}
+
 static HideSet *clone_hideset(HideSet *hs) {
   HideSet *cloned = alloc_table();
+  vec_push(&hideset_allocs, cloned);
   if (hs != NULL) {
     const Name *name;
     void *value;
