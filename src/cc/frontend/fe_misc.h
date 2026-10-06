@@ -35,6 +35,7 @@ typedef struct {
 typedef struct {
   bool warn_as_error;  // Treat warnings as errors
   bool common;
+  bool loop_sr;  // FPC: -floop-sr: loop strength reduction (pointers stepped)
   int optimize_level;
   WarningFlags warn;
 } CcFlags;

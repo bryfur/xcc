@@ -25,6 +25,7 @@ typedef struct LiveInterval {
   int end;
   int virt;  // Virtual register no.
   int phys;  // Mapped physical register no.
+  int weight;  // FPC: its uses and defs, 10x each loop around them (what spilling it costs)
 } LiveInterval;
 
 typedef struct RegAllocSettings {

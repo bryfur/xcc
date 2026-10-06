@@ -99,6 +99,7 @@ char *mangle(char *label) {
 static char pending_line[256];
 static bool has_pending;
 int emit_cur_bb_index = -1;
+IR *emit_next_ir;  // FPC: the IR after the one being emitted, in its block (or NULL)
 
 static void flush_pending(void) {
   if (has_pending) {
@@ -461,6 +462,7 @@ void emit_bb_irs(BBContainer *bbcon) {
       EMIT_LABEL(fmt_name(bb->label));
     for (int j = 0; j < bb->irs->len; ++j) {
       IR *ir = bb->irs->data[j];
+      emit_next_ir = j + 1 < bb->irs->len ? bb->irs->data[j + 1] : NULL;
       if (ir->kind == IR_ASM) {
         ei_asm(ir);
         continue;

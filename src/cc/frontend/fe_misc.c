@@ -28,6 +28,7 @@ int compile_error_count;
 CcFlags cc_flags = {
   .warn_as_error = false,
   .common = false,
+  .loop_sr = true,  // FPC
   .optimize_level = 0,
 };
 
@@ -54,6 +55,7 @@ static bool parse_flag_table(const char *optarg, bool value, const FlagTable *ta
 bool parse_fopt(const char *optarg, bool value) {
   static const FlagTable kFlagTable[] = {
     {"common", offsetof(CcFlags, common)},
+    {"loop-sr", offsetof(CcFlags, loop_sr)},  // FPC
   };
   return parse_flag_table(optarg, value, kFlagTable, ARRAY_SIZE(kFlagTable));
 }

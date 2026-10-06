@@ -7,6 +7,7 @@
 #include <stdlib.h>  // free
 #include <string.h>
 
+#include "fe_misc.h"  // cc_flags (FPC)
 #include "ir.h"
 #include "regalloc.h"
 #include "ssa.h"
@@ -1274,6 +1275,286 @@ static bool costly_const(IR *ir, VReg *c, int which) {
 }
 
 static bool defined_in(Vector *irs, int from, int to, VReg *v);
+static int def_index(Vector *irs, int before, VReg *v);
+static bool plain_int_vreg(VReg *v);
+static IR *copy_ir(IR *ir);
+
+// FPC: strength reduction of addresses in an innermost loop.  A load's or
+// store's address that is base + iv * scale (through additions of values
+// the loop doesn't change, multiplications by constants or by one such
+// value, shifts by constants, same-size casts; temporaries of its block
+// used once), iv a register the loop changes once, by a constant: a
+// pointer of its own, made before the loop and stepped where iv is (or
+// right after the access when that is in iv's block before it: ARM32 then
+// steps it in the access, post-indexed).
+
+typedef struct {
+  VReg *iv;         // NULL: none (the value doesn't depend on it)
+  int64_t coef;     // times iv (times coef_reg too, if any)
+  VReg *coef_reg;
+  int nchain;
+  int chain[12];    // the IRs computing it in the block (their indices)
+} LsrLin;
+
+static bool lsr_lin(Vector *irs, int pos, VReg *v, VReg *iv, unsigned char *inloop, int *uses,
+                    int *defs, int nvregs, LsrLin *out, int depth) {
+  out->iv = NULL;
+  out->coef = 0;
+  out->coef_reg = NULL;
+  if (v->flag & VRF_CONST)
+    return !(v->flag & VRF_FLONUM);
+  if (v->flag & (VRF_FLONUM | VRF_FORCEMEMORY | VRF_VOLATILEREG) || v->virt >= nvregs)
+    return false;
+  if (v == iv) {
+    out->iv = iv;
+    out->coef = 1;
+    return true;
+  }
+  if (!inloop[v->virt])
+    return true;  // invariant
+  if (depth <= 0 || defs[v->virt] != 1 || uses[v->virt] != 1 || out->nchain >= 12)
+    return false;
+  int k = def_index(irs, pos, v);
+  if (k < 0)
+    return false;
+  IR *ir = irs->data[k];
+  if (ir->additional_operands != NULL || ir->dst->vsize != VRegSize4)
+    return false;
+  out->chain[out->nchain++] = k;
+  LsrLin a = *out, b;
+  switch (ir->kind) {
+  case IR_ADD: case IR_SUB:
+    if (!lsr_lin(irs, k, ir->opr1, iv, inloop, uses, defs, nvregs, &a, depth - 1))
+      return false;
+    b = a;
+    b.iv = NULL;
+    if (!lsr_lin(irs, k, ir->opr2, iv, inloop, uses, defs, nvregs, &b, depth - 1))
+      return false;
+    if (a.iv != NULL && b.iv != NULL)
+      return false;
+    out->nchain = b.nchain;
+    memcpy(out->chain, b.chain, sizeof(out->chain));
+    if (b.iv != NULL) {
+      out->iv = iv;
+      out->coef = ir->kind == IR_SUB ? -b.coef : b.coef;
+      out->coef_reg = b.coef_reg;
+    } else {
+      out->iv = a.iv;
+      out->coef = a.coef;
+      out->coef_reg = a.coef_reg;
+    }
+    return true;
+  case IR_MUL: case IR_LSHIFT:
+    {
+      VReg *x = ir->opr1, *m = ir->opr2;
+      if (ir->kind == IR_MUL && (x->flag & VRF_CONST))
+        x = ir->opr2, m = ir->opr1;
+      if (!lsr_lin(irs, k, x, iv, inloop, uses, defs, nvregs, &a, depth - 1))
+        return false;
+      out->nchain = a.nchain;
+      memcpy(out->chain, a.chain, sizeof(out->chain));
+      out->iv = a.iv;
+      out->coef_reg = a.coef_reg;
+      if (a.iv == NULL)
+        return (m->flag & VRF_CONST) || !inloop[m->virt];  // invariant * invariant
+      if (m->flag & VRF_CONST) {
+        if (m->flag & VRF_FLONUM)
+          return false;
+        if (ir->kind == IR_LSHIFT) {
+          if (m->fixnum < 0 || m->fixnum > 31)
+            return false;
+          out->coef = a.coef * ((int64_t)1 << m->fixnum);
+        } else {
+          out->coef = a.coef * m->fixnum;
+        }
+        return true;
+      }
+      // times a register the loop doesn't change (once)
+      if (ir->kind != IR_MUL || a.coef_reg != NULL || inloop[m->virt] ||
+          (m->flag & (VRF_FLONUM | VRF_FORCEMEMORY)))
+        return false;
+      out->coef = a.coef;
+      out->coef_reg = m;
+      return true;
+    }
+  case IR_CAST:
+    if (ir->opr1->vsize != VRegSize4 || (ir->opr1->flag & VRF_FLONUM))
+      return false;
+    if (!lsr_lin(irs, k, ir->opr1, iv, inloop, uses, defs, nvregs, &a, depth - 1))
+      return false;
+    *out = a;
+    return true;
+  default:
+    return false;
+  }
+}
+
+static int cmp_int_desc(const void *a, const void *b) {
+  return *(const int*)b - *(const int*)a;
+}
+
+// Returns the number of pointers made
+static int strength_reduce(RegAlloc *ra, BBContainer *bbcon, int h, int j, BB *pre, int *pat,
+                           unsigned char *inloop, int *uses, int *defs, int nvregs) {
+  // The induction variables: defined once in the loop, by a constant step
+  VReg *ivs[8];
+  int64_t steps[8];
+  int ivbb[8], niv = 0;
+  int *ldefs = calloc_or_die(sizeof(int) * nvregs);
+  for (int k = h; k <= j; ++k) {
+    Vector *irs = ((BB*)bbcon->data[k])->irs;
+    for (int m = 0; m < irs->len; ++m) {
+      IR *ir = irs->data[m];
+      if (ir->dst != NULL && !(ir->dst->flag & VRF_CONST) && ir->dst->virt < nvregs)
+        ++ldefs[ir->dst->virt];
+    }
+  }
+  for (int k = h; k <= j && niv < 8; ++k) {
+    Vector *irs = ((BB*)bbcon->data[k])->irs;
+    for (int m = 0; m < irs->len && niv < 8; ++m) {
+      IR *ir = irs->data[m];
+      VReg *v = ir->dst;
+      if ((ir->kind == IR_ADD || ir->kind == IR_SUB) && v != NULL && v == ir->opr1 &&
+          v->virt < nvregs && ldefs[v->virt] == 1 && v->vsize == VRegSize4 &&
+          plain_int_vreg(v) && (ir->opr2->flag & VRF_CONST) && !(ir->opr2->flag & VRF_FLONUM)) {
+        ivs[niv] = v;
+        steps[niv] = ir->kind == IR_ADD ? ir->opr2->fixnum : -ir->opr2->fixnum;
+        ivbb[niv++] = k;
+      }
+    }
+  }
+  free(ldefs);
+  if (niv == 0)
+    return 0;
+
+  int made = 0;
+  for (int k = h; k <= j && made < 4; ++k) {
+    Vector *irs = ((BB*)bbcon->data[k])->irs;
+    for (int m = 0; m < irs->len && made < 4; ++m) {
+      IR *ir = irs->data[m];
+      VReg **paddr;
+      if (ir->kind == IR_LOAD && ir->opr2 == NULL && ir->additional_operands == NULL)
+        paddr = &ir->opr1;
+      else if (ir->kind == IR_STORE && ir->additional_operands == NULL)
+        paddr = &ir->opr2;
+      else
+        continue;
+      VReg *a = *paddr;
+      if ((a->flag & (VRF_CONST | VRF_FORCEMEMORY)) || a->virt >= nvregs || !inloop[a->virt])
+        continue;
+      LsrLin lin;
+      int ivi;
+      for (ivi = 0; ivi < niv; ++ivi) {
+        lin.nchain = 0;
+        if (lsr_lin(irs, m, a, ivs[ivi], inloop, uses, defs, nvregs, &lin, 8) && lin.iv != NULL &&
+            lin.coef != 0)
+          break;
+      }
+      if (ivi >= niv)
+        continue;
+      VReg *iv = ivs[ivi];
+      // (the chain: in order, each once)
+      qsort(lin.chain, lin.nchain, sizeof(int), cmp_int_desc);
+      int n = 0;
+      for (int q = 0; q < lin.nchain; ++q) {
+        if (n == 0 || lin.chain[n - 1] != lin.chain[q])
+          lin.chain[n++] = lin.chain[q];
+      }
+      lin.nchain = n;
+      if (n == 0)
+        continue;  // (the address is iv itself: a pointer stepped already)
+      // iv not stepped between the chain reading it and the access
+      bool ok = true;
+      for (int r = lin.chain[n - 1] + 1; r < m && ok; ++r)
+        ok = ((IR*)irs->data[r])->dst != iv;
+      if (!ok)
+        continue;
+      // Worth it only where the step goes into the access (post-indexed: a
+      // constant step, the access in iv's block before iv's step): else a
+      // pointer's step replaces what the address's computation cost, and
+      // its making before the loop costs more
+      int64_t sc0 = lin.coef * steps[ivi];
+      bool before_step = false;
+      if (ivbb[ivi] == k) {
+        for (int r = m + 1; r < irs->len; ++r) {
+          IR *x = irs->data[r];
+          if (x->dst == iv) {
+            before_step = true;
+            break;
+          }
+        }
+      }
+      if (lin.coef_reg != NULL || sc0 == 0 || sc0 < -255 || sc0 > 255 || !before_step ||
+          ((ir->kind == IR_LOAD ? ir->dst : ir->opr1)->flag & VRF_FLONUM) ||
+          (ir->kind == IR_LOAD ? ir->dst : ir->opr1)->vsize > VRegSize4)
+        continue;
+
+      // The pointer before the loop: the chain again there, iv as it is then
+      VReg **map_from = malloc_or_die(sizeof(VReg*) * (n + 1));
+      VReg **map_to = malloc_or_die(sizeof(VReg*) * (n + 1));
+      int at = *pat;
+      VReg *p = reg_alloc_spawn(ra, VRegSize4, a->flag & (VRF_MASK | VRF_UNALIGNED));
+      for (int q = n; --q >= 0; ) {
+        IR *src = irs->data[lin.chain[q]];
+        IR *cp = copy_ir(src);
+        VReg *nd = q == 0 ? p : reg_alloc_spawn(ra, src->dst->vsize, src->dst->flag & (VRF_MASK | VRF_UNALIGNED));
+        for (int r = 0; r < n - 1 - q; ++r) {
+          if (cp->opr1 == map_from[r])
+            cp->opr1 = map_to[r];
+          if (cp->opr2 == map_from[r])
+            cp->opr2 = map_to[r];
+        }
+        map_from[n - 1 - q] = src->dst;
+        map_to[n - 1 - q] = nd;
+        cp->dst = nd;
+        vec_insert(pre->irs, at++, cp);
+      }
+      free(map_from);
+      free(map_to);
+      // Its step
+      int64_t sc = lin.coef * steps[ivi];
+      VReg *step;
+      if (lin.coef_reg == NULL) {
+        step = reg_alloc_spawn_const(ra, (int32_t)sc, VRegSize4, 0);
+      } else {
+        step = reg_alloc_spawn(ra, VRegSize4, 0);
+        vec_insert(pre->irs, at++, new_ir_bop_raw(IR_MUL, step, lin.coef_reg,
+                                                  reg_alloc_spawn_const(ra, (int32_t)sc, VRegSize4, 0)));
+      }
+      *pat = at;
+      *paddr = p;
+      // The chain goes from the loop (its temporaries used only there)
+      for (int q = 0; q < n; ++q) {
+        vec_remove_at(irs, lin.chain[q]);
+        if (lin.chain[q] < m)
+          --m;
+      }
+      // The step: right after the access in iv's block before iv's step,
+      // else right after iv's step
+      IR *upd = new_ir_bop_raw(IR_ADD, p, p, step);
+      int ivpos = -1;
+      Vector *ivirs = ((BB*)bbcon->data[ivbb[ivi]])->irs;
+      for (int q = 0; q < ivirs->len; ++q) {
+        IR *x = ivirs->data[q];
+        if (x->dst == iv && (x->kind == IR_ADD || x->kind == IR_SUB)) {
+          ivpos = q;
+          break;
+        }
+      }
+      assert(ivpos >= 0);
+      if (ivirs == irs && m < ivpos) {
+        vec_insert(irs, m + 1, upd);
+        ++m;
+      } else {
+        vec_insert(ivirs, ivpos + 1, upd);
+        if (ivirs == irs && ivpos < m)
+          ++m;
+      }
+      ++made;
+    }
+  }
+  return made;
+}
 
 // A load's address as base + offset: through an ADD/SUB of a constant just
 // before it in its block (what tweak_irs folds into the load later)
@@ -1421,6 +1702,24 @@ static void hoist_loop_invariants(RegAlloc *ra, BBContainer *bbcon) {
 
     if (!inner)
       continue;
+
+    // Addresses stepped by pointers of their own
+    if (cc_flags.loop_sr &&
+        strength_reduce(ra, bbcon, h, j, pre, &at, inloop, uses, defs, vreg_count) > 0 &&
+        ra->vregs->len > vreg_count) {
+      int n = ra->vregs->len;
+      uses = realloc_or_die(uses, sizeof(*uses) * n);
+      defs = realloc_or_die(defs, sizeof(*defs) * n);
+      inloop = realloc_or_die(inloop, n);
+      hoisted = realloc_or_die(hoisted, n);
+      for (int i = vreg_count; i < n; ++i) {
+        uses[i] = 2;
+        defs[i] = 2;
+        inloop[i] = true;  // (the pointers are; what is made before: not looked at again)
+        hoisted[i] = false;
+      }
+      vreg_count = n;
+    }
 
     // A load in a loop that writes no memory, from an address it doesn't
     // change, made already before it (its first test, in `pre`): its value

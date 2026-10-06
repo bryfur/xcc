@@ -387,6 +387,21 @@ static const char *indexed(VReg *base, VReg *index, int shift) {
                     : fmt("[%s, %s]", R(base), R(index));
 }
 
+// FPC: the next IR steps the address by a constant ARM32 post-indexing
+// takes (-255..255): the step (that IR then emitted with the access), or 0
+static IR *s_skip_ir;
+
+static int post_step(VReg *addr) {
+  IR *nx = emit_next_ir;
+  if (nx == NULL || (nx->kind != IR_ADD && nx->kind != IR_SUB) || nx->dst != addr ||
+      nx->opr1 != addr || nx->opr2 == NULL || !(nx->opr2->flag & VRF_CONST) ||
+      (nx->opr2->flag & VRF_FLONUM) || nx->additional_operands != NULL || nx->bfx.sh_kind != 0 ||
+      (addr->flag & VRF_SPILLED) || addr->vsize != VRegSize4)
+    return 0;
+  int64_t c = nx->kind == IR_ADD ? nx->opr2->fixnum : -nx->opr2->fixnum;
+  return c >= -255 && c <= 255 ? (int)c : 0;
+}
+
 static void ei_load(IR *ir) {
   assert(!(ir->opr1->flag & VRF_CONST));
   bool spilled = ir->kind != IR_LOAD;
@@ -421,6 +436,13 @@ static void ei_load(IR *ir) {
   case VRegSize1:  op = u ? "ldrb" : "ldrsb"; if (!u) mk = MK_SIGNED; break;
   case VRegSize2:  op = u ? "ldrh" : "ldrsh"; if (!u) mk = MK_SIGNED; break;
   default:         op = "ldr"; break;
+  }
+  int step;
+  if (!spilled && ir->load.offset == 0 && !ir->load.unaligned &&
+      (step = post_step(ir->opr1)) != 0 && dst->phys != ir->opr1->phys) {
+    EMIT_ASM(op, R(dst), fmt("[%s], #%d", R(ir->opr1), step));  // FPC: post-indexed
+    s_skip_ir = emit_next_ir;
+    return;
   }
   const char *src = mem_dst(ir->opr1, ir->load.offset, spilled, mk);
   EMIT_ASM(op, R(dst), src);
@@ -463,6 +485,13 @@ static void ei_store(IR *ir) {
     } else {
       EMIT_ASM(op, R(src), target);
     }
+    return;
+  }
+  int step;
+  if (!spilled && ir->store.offset == 0 && !ir->store.unaligned && !(src->flag & VRF_CONST) &&
+      (step = post_step(ir->opr2)) != 0 && src->phys != ir->opr2->phys) {
+    EMIT_ASM(op, R(src), fmt("[%s], #%d", R(ir->opr2), step));  // FPC: post-indexed
+    s_skip_ir = emit_next_ir;
     return;
   }
   if (src->flag & VRF_CONST) {
@@ -533,6 +562,10 @@ static void ei_binop64(IR *ir, const char *op_lo, const char *op_hi) {
 static const char *shifted_opr2(IR *ir);  // FPC
 
 static void ei_add(IR *ir) {
+  if (ir == s_skip_ir) {  // FPC: done by the access before (post-indexed)
+    s_skip_ir = NULL;
+    return;
+  }
   VReg *dst = ir->dst;
   if (ir->additional_operands != NULL && ir->opr2 == NULL) {  // FPC: fuse_arm_ops
     EMIT_ASM("mla", R(dst), R((VReg*)ir->additional_operands->data[0]),
@@ -562,6 +595,10 @@ static void ei_add(IR *ir) {
 }
 
 static void ei_sub(IR *ir) {
+  if (ir == s_skip_ir) {  // FPC: done by the access before (post-indexed)
+    s_skip_ir = NULL;
+    return;
+  }
   VReg *dst = ir->dst;
   if (ir->additional_operands != NULL && ir->opr2 == NULL) {  // FPC: fuse_arm_ops
     EMIT_ASM("mls", R(dst), R((VReg*)ir->additional_operands->data[0]),

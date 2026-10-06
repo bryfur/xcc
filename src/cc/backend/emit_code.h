@@ -47,6 +47,7 @@ void emit_comm(const char *label, size_t size, size_t align);
 const char *emit_last_line(void);  // FPC: the last instruction, still changeable (NULL: none)
 void emit_replace_last_line(const char *line);
 extern int emit_cur_bb_index;  // FPC: the block being emitted (bb->index)
+extern IR *emit_next_ir;  // FPC: the next IR in the block (NULL: none)
 
 bool function_not_returned(FuncBackend *fnbe);
 

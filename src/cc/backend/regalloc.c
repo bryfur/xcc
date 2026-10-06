@@ -156,14 +156,17 @@ static bool split_at_interval(RegAlloc *ra, PhysicalRegisterSet *prsp, LiveInter
   int w = vreg_reg_width(ra, livreg);
   int align = w == 2 ? ra->settings->regset[is_flo].pair_align : 1;
   RegBits forbid = li->occupied_reg_bit | ra->settings->regset[is_flo].reserved;
-  int best = -1, best_end = -1;
+  // FPC: the place whose evicted intervals cost least to spill (their
+  // uses, 10x in each loop: weight), the one ending last of equal costs;
+  // li itself if it costs less
+  int best = -1, best_end = -1, best_cost = 0;
   for (int j = 0; j + w <= prsp->phys_max; ++j) {
     if (align > 1 && (j % align) != 0)
       continue;
     RegBits m = reg_mask(j, w);
     if (forbid & m)
       continue;
-    int min_end = 1 << 30;
+    int min_end = 1 << 30, cost = 0;
     bool ok = true;
     for (int k = 0; k < prsp->active_count; ++k) {
       LiveInterval *a = prsp->active[k];
@@ -176,14 +179,17 @@ static bool split_at_interval(RegAlloc *ra, PhysicalRegisterSet *prsp, LiveInter
       }
       if (a->end < min_end)
         min_end = a->end;
+      cost += a->weight;
     }
-    if (ok && min_end > best_end) {
+    if (ok && (best < 0 || cost < best_cost || (cost == best_cost && min_end > best_end))) {
       best = j;
       best_end = min_end;
+      best_cost = cost;
     }
   }
 
-  if (best < 0 || (!(livreg->flag & VRF_NO_SPILL) && best_end <= li->end)) {
+  if (best < 0 || (!(livreg->flag & VRF_NO_SPILL) &&
+                   (li->weight < best_cost || (li->weight == best_cost && best_end <= li->end)))) {
     li->phys = ra->settings->regset[GPREG].phys_max;
     li->state = LI_SPILL;
     return false;
@@ -250,11 +256,33 @@ static void check_live_interval(BBContainer *bbcon, int vreg_count, LiveInterval
     li->start = li->end = -1;
     li->virt = i;
     li->phys = -1;
+    li->weight = 0;
+  }
+
+  // FPC: each block's loop depth (the backward jumps' ranges around it)
+  int *depth = calloc_or_die(sizeof(int) * (bbcon->len + 1));
+  for (int i = 0; i < bbcon->len; ++i)
+    ((BB*)bbcon->data[i])->index = i;
+  for (int i = 0; i < bbcon->len; ++i) {
+    BB *bb = bbcon->data[i];
+    if (bb->irs->len == 0)
+      continue;
+    IR *last = bb->irs->data[bb->irs->len - 1];
+    if (last->kind != IR_JMP)
+      continue;
+    int t = last->jmp.bb->index;
+    if (t >= 0 && t <= i && bbcon->data[t] == last->jmp.bb) {
+      for (int k = t; k <= i; ++k)
+        ++depth[k];
+    }
   }
 
   int nip = 0;
   for (int i = 0; i < bbcon->len; ++i) {
     BB *bb = bbcon->data[i];
+    int w = 1;
+    for (int d = 0; d < depth[i] && d < 4; ++d)
+      w *= 10;
 
     set_inout_interval(bb->in_regs, intervals, nip);
 
@@ -275,11 +303,13 @@ static void check_live_interval(BBContainer *bbcon, int vreg_count, LiveInterval
           li->start = nip;
         if (li->end < nip)
           li->end = nip;
+        li->weight += w;
       }
     }
 
     set_inout_interval(bb->out_regs, intervals, nip);
   }
+  free(depth);
 }
 
 static void occupy_regs(RegAlloc *ra, Vector *actives, const RegBits occupy[2]) {
