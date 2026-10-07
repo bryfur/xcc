@@ -3711,6 +3711,30 @@ static void bit_simplify(RegAlloc *ra, BBContainer *bbcon) {
           continue;
         }
       }
+      // (a load) & 0xff or 0xffff, the load's value used only there: a
+      // narrower unsigned load (little endian: its low bytes first), the AND
+      // a widening of it
+      if (ir->kind == IR_BITAND && plain_int_vreg(dst) && dst->vsize <= VRegSize4 &&
+          (ir->opr2->flag & VRF_CONST) && !(ir->opr2->flag & VRF_FLONUM) &&
+          (ir->opr2->fixnum == 0xff || ir->opr2->fixnum == 0xffff) &&
+          !(ir->opr1->flag & VRF_CONST) && plain_int_vreg(ir->opr1) &&
+          uses[ir->opr1->virt] == 1 && defs[ir->opr1->virt] == 1) {
+        int k = def_index(irs, j, ir->opr1);
+        enum VRegSize nsz = ir->opr2->fixnum == 0xff ? VRegSize1 : VRegSize2;
+        IR *ld = k >= 0 ? irs->data[k] : NULL;
+        if (ld != NULL && ld->kind == IR_LOAD && ld->opr2 == NULL &&
+            ld->additional_operands == NULL && ld->dst->vsize > nsz &&
+            ld->dst->vsize <= VRegSize4 && !(ld->opr1->flag & VRF_VOLATILE)) {
+          VReg *t = ld->dst;
+          t->vsize = nsz;
+          t->flag |= VRF_UNSIGNED;
+          ir->kind = IR_CAST;
+          ir->opr2 = NULL;
+          ir->cast.fits = false;
+          ir->cast.trunc = 0;
+          continue;
+        }
+      }
       // x & m, x within m
       if (ir->kind == IR_BITAND && plain_int_vreg(dst) && (ir->opr2->flag & VRF_CONST) &&
           !(ir->opr2->flag & VRF_FLONUM) && !(ir->opr1->flag & VRF_CONST) &&
