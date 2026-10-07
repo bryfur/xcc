@@ -3630,6 +3630,42 @@ static int known_width(Vector *irs, int pos, VReg *v, int depth) {
   return r < by_type ? r : by_type;
 }
 
+#if XCC_TARGET_ARCH == XCC_ARCH_WASM
+// FPC: wcc: a narrowing cast whose value fits already (known bits), or
+// whose value only the next store of its size takes: no extension
+// (ir->cast.fits; the ARM32 backend's mark_fitting_casts)
+static void mark_fitting_casts(RegAlloc *ra, BBContainer *bbcon) {
+  int vreg_count = ra->vregs->len;
+  int *uses = calloc_or_die(sizeof(*uses) * vreg_count * 2 + 2);
+  int *defs = uses + vreg_count;
+  count_vreg_uses(bbcon, uses, defs);
+  for (int i = 0; i < bbcon->len; ++i) {
+    Vector *irs = ((BB*)bbcon->data[i])->irs;
+    for (int j = 0; j < irs->len; ++j) {
+      IR *ir = irs->data[j];
+      if (ir->kind != IR_CAST)
+        continue;
+      ir->cast.fits = false;
+      VReg *dst = ir->dst, *src = ir->opr1;
+      if ((dst->flag | src->flag) & VRF_FLONUM || dst->vsize >= VRegSize4 ||
+          src->vsize > VRegSize4 || (src->flag & VRF_CONST))
+        continue;
+      int d = 8 << dst->vsize;
+      int k = known_width(irs, j, src, 6);
+      ir->cast.fits = (dst->flag & VRF_UNSIGNED) ? k <= d : k < d;
+      if (!ir->cast.fits && j + 1 < irs->len && !(dst->flag & (VRF_FORCEMEMORY | VRF_VOLATILEREG)) &&
+          dst->virt < vreg_count && uses[dst->virt] == 1 && defs[dst->virt] == 1) {
+        IR *st = irs->data[j + 1];
+        if (st->kind == IR_STORE && st->opr1 == dst && st->opr2 != dst &&
+            st->additional_operands == NULL)
+          ir->cast.fits = true;
+      }
+    }
+  }
+  free(uses);
+}
+#endif
+
 static void bit_simplify(RegAlloc *ra, BBContainer *bbcon) {
   int vreg_count = ra->vregs->len;
   int *uses = calloc_or_die(sizeof(*uses) * vreg_count * 2);
@@ -3896,6 +3932,9 @@ void optimize(RegAlloc *ra, BBContainer *bbcon) {
     TIMED(8, "bbs", remove_unnecessary_bb(bbcon); detect_from_bbs(bbcon));
     TIMED(9, "licm", hoist_loop_invariants(ra, bbcon));  // FPC
     TIMED(10, "coalesce3", coalesce_moves(ra, bbcon); coalesce_across_fall(ra, bbcon));  // FPC: the loads made MOVs
+#if XCC_TARGET_ARCH == XCC_ARCH_WASM
+    mark_fitting_casts(ra, bbcon);  // FPC (the last: nothing changes the casts after it)
+#endif
   }
   detect_from_bbs(bbcon);
 }

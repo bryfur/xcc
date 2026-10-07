@@ -502,6 +502,8 @@ static void emit_cast(WE *we, IR *ir) {
   bool du = (dst->flag & VRF_UNSIGNED) != 0, su = (src->flag & VRF_UNSIGNED) != 0;
   int powd = dst->vsize, pows = src->vsize;
   if (!df && !sf) {
+    if (ir->cast.fits && powd < VRegSize4 && pows <= VRegSize4)
+      return;  // (the value fits already, or a store of its size takes it)
     if (powd == VRegSize8) {
       if (pows != VRegSize8)
         op(we, su ? OP_I64_EXTEND_I32_U : OP_I64_EXTEND_I32_S);
@@ -1597,6 +1599,53 @@ static bool fix_irreducible(WE *we) {
   return false;
 }
 
+// A switch's range check just before its table jump: the table jump's
+// default instead (br_table checks anyway)
+static void fold_table_checks(WE *we) {
+  BBContainer *bbcon = we->bbcon;
+  for (int i = 0; i < bbcon->len; ++i) {
+    BB *a = bbcon->data[i];
+    IR *jmp = a->irs->len > 0 ? a->irs->data[a->irs->len - 1] : NULL;
+    BB *b = a->next;
+    if (jmp == NULL || jmp->kind != IR_JMP || jmp->jmp.cond != COND_GT || b == NULL ||
+        b->irs->len != 1 || jmp->opr1 == NULL || !(jmp->opr1->flag & VRF_UNSIGNED) ||
+        (jmp->opr1->flag & VRF_CONST) || jmp->opr2 == NULL || !(jmp->opr2->flag & VRF_CONST))
+      continue;
+    IR *tj = b->irs->data[0];
+    if (tj->kind != IR_TJMP || tj->opr1 != jmp->opr1 ||
+        (int64_t)tj->tjmp.len != jmp->opr2->fixnum + 1)
+      continue;
+    // b reached only from a (by its fall)
+    bool only = true;
+    for (int k = 0; k < bbcon->len && only; ++k) {
+      BB *x = bbcon->data[k];
+      if (x == a)
+        continue;
+      IR *l = x->irs->len > 0 ? x->irs->data[x->irs->len - 1] : NULL;
+      if (x->next == b && !(l != NULL && ((l->kind == IR_JMP && l->jmp.cond == COND_ANY) ||
+                                          l->kind == IR_TJMP)))
+        only = false;
+      if (l != NULL && l->kind == IR_JMP && l->jmp.bb == b)
+        only = false;
+      if (l != NULL && l->kind == IR_TJMP)
+        for (size_t m = 0; m < l->tjmp.len; ++m)
+          if (l->tjmp.bbs[m] == b)
+            only = false;
+    }
+    if (!only)
+      continue;
+    size_t len = tj->tjmp.len;
+    BB **bbs = malloc_or_die(sizeof(BB*) * (len + 1));
+    memcpy(bbs, tj->tjmp.bbs, sizeof(BB*) * len);
+    bbs[len] = jmp->jmp.bb;  // (the last: br_table's default)
+    jmp->kind = IR_TJMP;
+    jmp->opr2 = NULL;
+    jmp->tjmp.bbs = bbs;
+    jmp->tjmp.len = len + 1;
+    vec_clear(b->irs);  // (b: not reached any more)
+  }
+}
+
 static bool emit_function(WE *we) {
   Function *func = we->func;
   const Type *functype = func->type;
@@ -1605,6 +1654,7 @@ static bool emit_function(WE *we) {
   we->nbb = we->bbcon->len;
   if (we->nbb == 0)
     return false;
+  fold_table_checks(we);
   if (!fix_irreducible(we)) {
     if (getenv("WCC_IRLIST") != NULL)
       fprintf(stderr, "irreducible: not fixed\n");
