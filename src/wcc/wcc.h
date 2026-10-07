@@ -110,6 +110,11 @@ bool is_stack_param(const Type *type);
 GVarInfo *get_gvar_info_from_name(const Name *name);
 GVarInfo *get_gvar_info(Expr *expr);
 int getsert_func_type_index(const Type *type, bool reg);
+void wasm_func_type(const Type *type, DataStorage *ds);  // FPC: its encoding
+
+// wasm_opt (FPC)
+void wasm_opt_func(DataStorage *code, Vector *relocs, const unsigned char *ptypes,
+                   uint32_t nparams);
 static inline int get_func_type_index(const Type *type) {
   return getsert_func_type_index(type, false);
 }

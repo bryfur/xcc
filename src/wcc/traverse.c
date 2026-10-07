@@ -25,7 +25,7 @@ bool is_stack_param(const Type *type) {
   return !is_prim_type(type);
 }
 
-static void wasm_func_type(const Type *type, DataStorage *ds) {
+void wasm_func_type(const Type *type, DataStorage *ds) {
   const Type *rettype = type->func.ret;
   bool ret_small_struct = is_small_struct(rettype);
   bool ret_param = rettype->kind == TY_STRUCT && !ret_small_struct && !is_phantom_struct(rettype);

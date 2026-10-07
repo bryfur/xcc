@@ -950,6 +950,15 @@ static void gen_defun(Function *func) {
 
   ADD_CODE(OP_END);
 
+  {  // FPC: the finished code optimised (wasm_opt.c)
+    DataStorage ft;
+    wasm_func_type(func->type, &ft);
+    unsigned char *p = ft.buf;
+    uint32_t np = read_uleb128(p, &p);
+    wasm_opt_func(code, extra->reloc_code, p, np);
+    data_release(&ft);
+  }
+
   size_t before = code->len;
   data_close_chunk(code, -1);
   extra->offset = code->len - before;
