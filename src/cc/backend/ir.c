@@ -420,19 +420,22 @@ void detect_from_bbs(BBContainer *bbcon) {
   for (int i = 0; i < count; ++i) {
     BB *bb = bbcon->data[i];
     vec_clear(bb->from_bbs);
+    bb->index = i;  // FPC: the blocks seen marked by their places
   }
 
-  Table checked;
-  table_init(&checked);
+  char *checked = calloc_or_die(count + 1);
   Vector unchecked;
   vec_init(&unchecked);
   vec_push(&unchecked, bbcon->data[0]);
 
   do {
     BB *bb = vec_pop(&unchecked);
-    if (table_try_get(&checked, bb->label, NULL))
+    int bi = bb->index;
+    if (bi < 0 || bi >= count || bbcon->data[bi] != bb)
+      continue;  // (not one of the function's blocks any more)
+    if (checked[bi])
       continue;
-    table_put(&checked, bb->label, bb);
+    checked[bi] = 1;
 
     Vector *irs = bb->irs;
     if (irs->len > 0) {
@@ -463,6 +466,8 @@ void detect_from_bbs(BBContainer *bbcon) {
       vec_push(&unchecked, next);
     }
   } while (unchecked.len > 0);
+  vec_release(&unchecked);
+  free(checked);
 }
 
 

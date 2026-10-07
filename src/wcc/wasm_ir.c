@@ -27,6 +27,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "../cc/backend/be_aux.h"
 #include "../cc/backend/codegen.h"
@@ -1829,7 +1830,26 @@ static void dump_function(Function *func, BBContainer *bbcon) {
 #define ARENA_RELEASE(m)  do {} while (0)
 #endif
 
+// WCC_IRTIME=1: the IR path's phases' times, at the end
+static double ir_time[5];
+static double ir_now(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+static void print_ir_time(void) {
+  fprintf(stderr, "wcc IR: gen %.1f ms, optimize %.1f ms, emit %.1f ms, wasm_opt %.1f ms\n",
+          ir_time[0] * 1e3, ir_time[1] * 1e3, ir_time[2] * 1e3, ir_time[3] * 1e3);
+}
+
 static bool compile_ir(Function *func, DataStorage *code, Vector *relocs) {
+  static int timing = -1;
+  if (timing < 0) {
+    timing = getenv("WCC_IRTIME") != NULL;
+    if (timing)
+      atexit(print_ir_time);
+  }
+  double t0 = timing ? ir_now() : 0, t1 = 0, t2 = 0, t3 = 0;
   void *wcc_extra = func->extra;
   bool ok = false;
   static int arena_stats = -1;
@@ -1849,6 +1869,8 @@ static bool compile_ir(Function *func, DataStorage *code, Vector *relocs) {
   curra = fnbe->ra;
   if (arena_stats)
     a1 = ARENA_USED();
+  if (timing)
+    t1 = ir_now();
   if (getenv("WCC_NOOPTIM") == NULL)
     optimize(fnbe->ra, fnbe->bbcon);
   else
@@ -1860,6 +1882,8 @@ static bool compile_ir(Function *func, DataStorage *code, Vector *relocs) {
   curfunc = NULL;
   if (arena_stats)
     a2 = ARENA_USED();
+  if (timing)
+    t2 = ir_now();
   {
     static int dump = -1;
     if (dump < 0)
@@ -1936,11 +1960,20 @@ static bool compile_ir(Function *func, DataStorage *code, Vector *relocs) {
             a1 - a0, a2 - a1, ARENA_USED() - a2);
   ARENA_RELEASE(mark);
 
+  if (timing)
+    t3 = ir_now();
   if (ok) {
     data_append(code, out, ncode);
     wir_relocs_restore(out + ncode, nrel, relocs);
     wasm_opt_func(code, relocs, (unsigned char*)out + ncode + nrel, nparams);
     free(out);
+  }
+  if (timing) {
+    double t4 = ir_now();
+    ir_time[0] += t1 - t0;
+    ir_time[1] += t2 - t1;
+    ir_time[2] += t3 - t2;
+    ir_time[3] += t4 - t3;
   }
   return ok;
 }

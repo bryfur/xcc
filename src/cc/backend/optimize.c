@@ -63,10 +63,15 @@ static void clear_unused_bbs(BBContainer *bbcon) {
 }
 
 static void remove_unnecessary_bb(BBContainer *bbcon) {
-  Table keeptbl;
+  // FPC: the blocks kept marked by their places (not a table of labels)
   for (;;) {
-    table_init(&keeptbl);
     assert(bbcon->len > 0);
+    int n = bbcon->len;
+    for (int i = 0; i < n; ++i)
+      ((BB*)bbcon->data[i])->index = i;
+    char *keep = calloc_or_die(n + 1);
+#define KEEP(b)  do { BB *b_ = (b); int k_ = b_->index; \
+    if (k_ >= 0 && k_ < n && bbcon->data[k_] == b_) keep[k_] = 1; } while (0)
 
     for (int i = 0; i < bbcon->len; ++i) {
       BB *bb = bbcon->data[i];
@@ -97,41 +102,40 @@ static void remove_unnecessary_bb(BBContainer *bbcon) {
       }
 
       if (ir_jmp != NULL)
-        table_put(&keeptbl, ir_jmp->jmp.bb->label, bb);
+        KEEP(ir_jmp->jmp.bb);
       if ((ir_jmp == NULL || ir_jmp->jmp.cond != COND_ANY) && bb->next != NULL)
-        table_put(&keeptbl, bb->next->label, bb);
+        KEEP(bb->next);
 
       IR *tjmp = is_last_jtable(bb);
       if (tjmp != NULL) {
         BB **bbs = tjmp->tjmp.bbs;
         for (size_t j = 0, len = tjmp->tjmp.len; j < len; ++j)
-          table_put(&keeptbl, bbs[j]->label, bb);
+          KEEP(bbs[j]);
       }
 
       if (remove)
-        table_delete(&keeptbl, bb->label);
+        keep[i] = 0;
     }
+#undef KEEP
 
     bool again = false;
-    for (int i = 1; i < bbcon->len; ++i) {
+    int w = 1;
+    for (int i = 1; i < n; ++i) {
       BB *bb = bbcon->data[i];
-      if (!table_try_get(&keeptbl, bb->label, NULL)) {
-        if (i > 0) {
-          BB *pbb = bbcon->data[i - 1];
-          pbb->next = bb->next;
-        }
-
-        vec_remove_at(bbcon, i);
-        --i;
+      if (!keep[i]) {
+        BB *pbb = bbcon->data[w - 1];
+        pbb->next = bb->next;
         again = true;
+      } else {
+        bbcon->data[w++] = bb;
       }
     }
+    bbcon->len = w;
+    free(keep);
     if (!again)
       break;
   }
 }
-
-//
 
 static void remove_unused_vregs(RegAlloc *ra, BBContainer *bbcon) {
   int vreg_count = ra->vregs->len;
