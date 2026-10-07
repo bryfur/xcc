@@ -535,15 +535,15 @@ static void emit_cast(WE *we, IR *ir) {
                                : (u ? OP_F64_CONVERT_I32_U : OP_F64_CONVERT_I32_S));
     return;
   }
-  // floating point -> int
-  if (powd == VRegSize8) {
-    op(we, pows == VRegSize4 ? (du ? OP_I64_TRUNC_F32_U : OP_I64_TRUNC_F32_S)
-                             : (du ? OP_I64_TRUNC_F64_U : OP_I64_TRUNC_F64_S));
-  } else {
-    bool u = du && powd == VRegSize4;
-    op(we, pows == VRegSize4 ? (u ? OP_I32_TRUNC_F32_U : OP_I32_TRUNC_F32_S)
-                             : (u ? OP_I32_TRUNC_F64_U : OP_I32_TRUNC_F64_S));
-  }
+  // floating point -> int: saturating (out of range is undefined in C; the
+  // trapping conversions cost the JIT range checks)
+  int sub;
+  if (powd == VRegSize8)
+    sub = 4 + (pows == VRegSize4 ? 0 : 2) + du;
+  else
+    sub = (pows == VRegSize4 ? 0 : 2) + (du && powd == VRegSize4);
+  op(we, OP_0xFC);
+  uleb(we, sub);
 }
 
 static void emit_bop(WE *we, Vector *irs, int j) {
@@ -1797,7 +1797,15 @@ static bool compile_ir(Function *func, DataStorage *code, Vector *relocs) {
   we.code = &body;
   // (relocations: offsets in the body for now)
   int nrel0 = relocs->len;
-  ok = emit_function(&we);
+  // (WCC_IRFAIL=1: every function through the IR code generator and the
+  // optimiser, then wcc's own code generator after all: a test that the
+  // first leaves the syntax tree as wcc's wants it)
+  static int irfail = -1;
+  if (irfail < 0) {
+    const char *e = getenv("WCC_IRFAIL");
+    irfail = e != NULL && *e == '1';
+  }
+  ok = !irfail && emit_function(&we);
   if (ok) {
     DataStorage head;
     data_init(&head);

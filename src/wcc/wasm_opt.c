@@ -45,6 +45,7 @@ typedef struct {
   uint8_t del;     // removed
   uint8_t reloc;   // a relocation points into it (kept as it is)
   uint8_t loops;   // loops around it
+  uint8_t eqz;     // an i32.eqz before it
 } WI;
 
 typedef struct {
@@ -576,6 +577,53 @@ static void coalesce(WOpt *o) {
   free(live); free(partner); free(weight); free(ig);
 }
 
+// `if (then nothing) else B end`: `if B end` on the opposite condition
+// (a comparison just before it inverted, or i32.eqz); `if A else end`:
+// `if A end`
+static void drop_empty_branches(WOpt *o) {
+  static const unsigned char kInv[][2] = {
+    {OP_I32_EQ, OP_I32_NE}, {OP_I32_LT_S, OP_I32_GE_S}, {OP_I32_LT_U, OP_I32_GE_U},
+    {OP_I32_GT_S, OP_I32_LE_S}, {OP_I32_GT_U, OP_I32_LE_U},
+    {OP_I64_EQ, OP_I64_NE}, {OP_I64_LT_S, OP_I64_GE_S}, {OP_I64_LT_U, OP_I64_GE_U},
+    {OP_I64_GT_S, OP_I64_LE_S}, {OP_I64_GT_U, OP_I64_LE_U},
+  };
+  for (int i = 0; i < o->n; ++i) {
+    WI *w = &o->wi[i];
+    if (w->del || w->op != OP_IF || w->alt < 0 || o->code[w->pos + 1] != WT_VOID)
+      continue;
+    WI *el = &o->wi[w->alt];
+    int k = i + 1;
+    while (k < o->n && o->wi[k].del)
+      ++k;
+    if (k == w->alt) {  // (then nothing)
+      int c = prev_live(o, i, 0);
+      bool done = false;
+      if (c >= 0 && !o->wi[c].reloc && o->wi[c].len == 1) {
+        unsigned char op = o->wi[c].op;
+        for (size_t m = 0; m < sizeof(kInv) / sizeof(*kInv) && !done; ++m) {
+          if (op == kInv[m][0] || op == kInv[m][1]) {
+            o->wi[c].op = op == kInv[m][0] ? kInv[m][1] : kInv[m][0];
+            done = true;
+          }
+        }
+        if (!done && op == OP_I32_EQZ) {
+          o->wi[c].del = 1;
+          done = true;
+        }
+      }
+      if (!done)
+        w->eqz = 1;
+      el->del = 1;
+      continue;
+    }
+    k = w->alt + 1;
+    while (k < o->n && o->wi[k].del)
+      ++k;
+    if (k == w->match)  // (else nothing)
+      el->del = 1;
+  }
+}
+
 static void encode(WOpt *o, DataStorage *code, Vector *relocs) {
   DataStorage out;
   data_init(&out);
@@ -609,6 +657,12 @@ static void encode(WOpt *o, DataStorage *code, Vector *relocs) {
       data_push(&out, OP_DROP);
       break;
     default:
+      if (w->eqz)
+        data_push(&out, OP_I32_EQZ);
+      if (w->len == 1) {  // (an operation without immediates, maybe changed)
+        data_push(&out, w->op);
+        break;
+      }
       data_append(&out, o->code + w->pos, w->len);
       break;
     }
@@ -687,6 +741,7 @@ void wasm_opt_func(DataStorage *code, Vector *relocs, const unsigned char *ptype
     liveness(&o);
     for (int i = 0; i < 4 && cleanup(&o, tee); ++i)
       liveness(&o);
+    drop_empty_branches(&o);
     encode(&o, code, relocs);
   }
 

@@ -1492,10 +1492,18 @@ static int strength_reduce(RegAlloc *ra, BBContainer *bbcon, int h, int j, BB *p
           }
         }
       }
+#if XCC_TARGET_ARCH == XCC_ARCH_WASM
+      // (wasm: a pointer's step, by any amount the loop doesn't change,
+      // replaces the address's computation each time)
+      UNUSED(before_step);
+      if (sc0 == 0 || sc0 < INT32_MIN || sc0 > INT32_MAX)
+        continue;
+#else
       if (lin.coef_reg != NULL || sc0 == 0 || sc0 < -255 || sc0 > 255 || !before_step ||
           ((ir->kind == IR_LOAD ? ir->dst : ir->opr1)->flag & VRF_FLONUM) ||
           (ir->kind == IR_LOAD ? ir->dst : ir->opr1)->vsize > VRegSize4)
         continue;
+#endif
 
       // The pointer before the loop: the chain again there, iv as it is then
       VReg **map_from = malloc_or_die(sizeof(VReg*) * (n + 1));
@@ -1550,7 +1558,11 @@ static int strength_reduce(RegAlloc *ra, BBContainer *bbcon, int h, int j, BB *p
         }
       }
       assert(ivpos >= 0);
+#if XCC_TARGET_ARCH == XCC_ARCH_WASM
+      if (false) {  // (wasm: after iv's step: the access's value used where it is loaded)
+#else
       if (ivirs == irs && m < ivpos) {
+#endif
         vec_insert(irs, m + 1, upd);
         ++m;
       } else {
