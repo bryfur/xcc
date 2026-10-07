@@ -144,6 +144,7 @@ typedef struct {
   int reg_arg_count;
   int vaarg_start;
   bool global;
+  const struct Type *functype;  // FPC: the callee's type (wcc: call_indirect's)
 } IrCallInfo;
 
 typedef struct IR {

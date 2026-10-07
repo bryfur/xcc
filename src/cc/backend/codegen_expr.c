@@ -735,7 +735,12 @@ static inline void gen_funargs(Expr *expr, FuncallWork *work) {
                                           : calloc_or_die(total_arg_count * sizeof(*arg_vregs));
   work->arg_vregs = arg_vregs;
 
-#if XCC_TARGET_ARCH == XCC_ARCH_ARM32
+#if XCC_TARGET_ARCH == XCC_ARCH_WASM
+  // FPC: wcc (wasm_ir.c): every argument a wasm value of the call, in order
+  // (scalars only: wcc's own code generator does the rest)
+  for (int j = 0; j < args->len; ++j)
+    arg_vregs[j + work->arg_start] = gen_expr(args->data[j]);
+#elif XCC_TARGET_ARCH == XCC_ARCH_ARM32
   // FPC: ARM32: first what goes on the stack (a struct's address is worked
   // out once, its part on the stack copied there), then the registers (a
   // struct's first words loaded from it).
@@ -859,7 +864,17 @@ static inline VReg *gen_funcall_sub(Expr *expr, FuncallWork *work) {
   set_call_info(callinfo, funcname, global, total_arg_count,
                 work->reg_arg_count[GPREG] + work->reg_arg_count[FPREG] + ret_count,
                 work->arg_vregs, vaarg_start);
+  callinfo->functype = functype;  // FPC
   IR *call = new_ir_call(callinfo, dst, freg);
+#if XCC_TARGET_ARCH == XCC_ARCH_WASM
+  // FPC: wcc: the arguments are the call's operands (no PUSHARG): the
+  // optimiser sees them used and renames them there
+  if (total_arg_count > 0) {
+    call->additional_operands = new_vector();
+    for (int i = 0; i < total_arg_count; ++i)
+      vec_push(call->additional_operands, work->arg_vregs[i]);
+  }
+#endif
 
   FuncallInfo *fcinfo = calloc_or_die(sizeof(*fcinfo));
   fcinfo->call = call;
@@ -1016,7 +1031,8 @@ static VReg *gen_assign_sub(Expr *lhs, Expr *rhs) {
 }
 
 static VReg *gen_assign(Expr *expr) {
-  assert(same_type(expr->type, expr->bop.lhs->type));
+  // (FPC: wcc's traverse.c makes assignments of type void)
+  assert(expr->type->kind == TY_VOID || same_type(expr->type, expr->bop.lhs->type));
   return gen_assign_sub(expr->bop.lhs, expr->bop.rhs);
 }
 

@@ -615,11 +615,21 @@ static void gen_switch_cond(Stmt *stmt) {
   } else {
     if (len > 0) {
       // Sort cases in increasing order.
-      qsort(cases->data, len, sizeof(void*), compare_cases);
+      Stmt **sorted = (Stmt**)cases->data;
+#if XCC_TARGET_ARCH == XCC_ARCH_WASM
+      // FPC: a copy (wcc's own code generator may do the function yet,
+      // the cases in their order)
+      sorted = malloc_or_die(sizeof(*sorted) * len);
+      memcpy(sorted, cases->data, sizeof(*sorted) * len);
+#endif
+      qsort(sorted, len, sizeof(void*), compare_cases);
 
       if (stmt->switch_.default_ != NULL)
         --len;  // Ignore default.
-      gen_switch_cond_recur(stmt, vreg, (Stmt**)cases->data, len);
+      gen_switch_cond_recur(stmt, vreg, sorted, len);
+#if XCC_TARGET_ARCH == XCC_ARCH_WASM
+      free(sorted);
+#endif
     } else {
       Stmt *def = stmt->switch_.default_;
       new_ir_jmp(def != NULL ? def->case_.bb : stmt->switch_.break_bb);
@@ -950,6 +960,9 @@ void gen_stmt(Stmt *stmt) {
   case ST_LABEL:  gen_label(stmt); break;
   case ST_VARDECL:  gen_vardecl(stmt->vardecl); break;
   case ST_ASM:  gen_asm(stmt); break;
+#if XCC_TARGET_ARCH == XCC_ARCH_WASM
+  case ST_BLOCK_FOR_LABEL:  gen_stmts(stmt->block_for_label.stmts); break;  // FPC: wcc's
+#endif
   }
 }
 

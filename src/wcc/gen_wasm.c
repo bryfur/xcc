@@ -15,6 +15,7 @@
 #include "var.h"
 #include "wasm.h"
 #include "wasm_obj.h"
+#include "wcc_ir.h"
 
 int cur_depth;
 static int break_depth;
@@ -921,6 +922,220 @@ static inline void epilogue(Function *func, uint32_t frame_size, Expr *bpvar, Ex
   }
 }
 
+// FPC: functions through xcc's IR and optimiser (wasm_ir.c)
+
+static void push_reloc(Function *func, int type, uint32_t index, uint32_t offset) {
+  FuncExtra *extra = func->extra;
+  RelocInfo *ri = calloc_or_die(sizeof(*ri));
+  ri->type = type;
+  ri->offset = offset;
+  ri->addend = 0;
+  ri->index = index;
+  vec_push(extra->reloc_code, ri);
+}
+
+bool wir_global_addr(Function *func, DataStorage *code, const Name *label) {
+  GVarInfo *gvinfo = get_gvar_info_from_name(label);
+  if (gvinfo != NULL) {
+    if (equal_name(label, alloc_cname(SP_NAME)))
+      return false;
+    data_push(code, OP_I32_CONST);
+    push_reloc(func, R_WASM_MEMORY_ADDR_SLEB, gvinfo->symbol_index, code->len);
+    data_varint32(code, -1, gvinfo->non_prim.address);
+    return true;
+  }
+  FuncInfo *finfo = table_get(&indirect_function_table, label);
+  if (finfo != NULL && finfo->indirect_index > 0) {
+    data_push(code, OP_I32_CONST);
+    push_reloc(func, R_WASM_TABLE_INDEX_SLEB, finfo->index, code->len);
+    data_varint32(code, -1, finfo->indirect_index);
+    return true;
+  }
+  return false;
+}
+
+bool wir_call(Function *func, DataStorage *code, const Name *label) {
+  FuncInfo *finfo = table_get(&func_info_table, label);
+  if (finfo == NULL || finfo->varinfo == NULL)
+    return false;
+  FuncInfo *target = finfo;
+  const VarInfo *alias = finfo->varinfo->global.alias;
+  if (alias != NULL) {
+    target = table_get(&func_info_table, alias->ident->ident);
+    if (target == NULL)
+      return false;
+  }
+  data_push(code, OP_CALL);
+  push_reloc(func, R_WASM_FUNCTION_INDEX_LEB, finfo->index, code->len);
+  data_varuint32(code, -1, target->index);
+  return true;
+}
+
+bool wir_call_indirect(Function *func, DataStorage *code, const Type *functype) {
+  int index = get_func_type_index(functype);
+  if (index < 0)
+    return false;
+  TableInfo *ti = getsert_indirect_function_table();
+  data_push(code, OP_CALL_INDIRECT);
+  push_reloc(func, R_WASM_TYPE_INDEX_LEB, index, code->len);
+  data_varuint32(code, -1, index);
+  push_reloc(func, R_WASM_TABLE_NUMBER_LEB, ti->symbol_index, code->len);
+  data_varuint32(code, -1, ti->index);
+  return true;
+}
+
+bool wir_sp(Function *func, DataStorage *code, bool set) {
+  GVarInfo *gvinfo = get_gvar_info_from_name(alloc_cname(SP_NAME));
+  if (gvinfo == NULL)
+    return false;
+  data_push(code, set ? OP_GLOBAL_SET : OP_GLOBAL_GET);
+  push_reloc(func, R_WASM_GLOBAL_INDEX_LEB, gvinfo->symbol_index, code->len);
+  data_varuint32(code, -1, gvinfo->prim.index);
+  return true;
+}
+
+void wir_relocs_shift(Vector *relocs, int from, uint32_t delta) {
+  for (int i = from; i < relocs->len; ++i)
+    ((RelocInfo*)relocs->data[i])->offset += delta;
+}
+
+void wir_relocs_drop(Vector *relocs, int from) {
+  while (relocs->len > from)
+    free(vec_pop(relocs));
+}
+
+// What xcc's IR code generator does as wcc does: scalars in and out of
+// functions and calls, no builtins, no inline assembly, no alloca/VLA,
+// no setjmp.
+static bool ir_expr_ok(Expr *expr);
+static bool ir_stmt_ok(Stmt *stmt);
+
+static bool ir_stmts_ok(Vector *stmts) {
+  for (int i = 0; stmts != NULL && i < stmts->len; ++i)
+    if (!ir_stmt_ok(stmts->data[i]))
+      return false;
+  return true;
+}
+
+static bool ir_scalar_type(const Type *type) {
+  return is_prim_type(type);
+}
+
+static bool ir_expr_ok(Expr *expr) {
+  if (expr == NULL)
+    return true;
+  switch (expr->kind) {
+  case EX_FIXNUM: case EX_FLONUM: case EX_STR: case EX_VAR:
+    return true;
+  case EX_ADD: case EX_SUB: case EX_MUL: case EX_DIV: case EX_MOD: case EX_BITAND:
+  case EX_BITOR: case EX_BITXOR: case EX_LSHIFT: case EX_RSHIFT: case EX_EQ: case EX_NE:
+  case EX_LT: case EX_LE: case EX_GE: case EX_GT: case EX_LOGAND: case EX_LOGIOR:
+  case EX_ASSIGN: case EX_COMMA: case EX_EXPECT:
+    return ir_expr_ok(expr->bop.lhs) && ir_expr_ok(expr->bop.rhs);
+  case EX_POS: case EX_NEG: case EX_BITNOT: case EX_PREINC: case EX_PREDEC: case EX_POSTINC:
+  case EX_POSTDEC: case EX_REF: case EX_DEREF: case EX_CAST:
+    return ir_expr_ok(expr->unary.sub);
+  case EX_TERNARY:
+    return ir_expr_ok(expr->ternary.cond) && ir_expr_ok(expr->ternary.tval) &&
+           ir_expr_ok(expr->ternary.fval);
+  case EX_MEMBER:
+    return ir_expr_ok(expr->member.target);
+  case EX_FUNCALL:
+    {
+      Expr *func = expr->funcall.func;
+      if (func->kind == EX_VAR && is_global_scope(func->var.scope) &&
+          table_try_get(&builtin_function_table, func->var.name, NULL))
+        return false;
+      const Type *functype = get_callee_type(func->type);
+      if (functype == NULL || functype->func.vaargs || functype->func.params == NULL)
+        return false;
+      const Type *rettype = functype->func.ret;
+      if (rettype->kind != TY_VOID && !ir_scalar_type(rettype))
+        return false;
+      Vector *args = expr->funcall.args;
+      if (args->len != functype->func.params->len)
+        return false;
+      for (int i = 0; i < args->len; ++i) {
+        Expr *arg = args->data[i];
+        if (!ir_scalar_type(arg->type) ||
+            !ir_scalar_type(functype->func.params->data[i]) || !ir_expr_ok(arg))
+          return false;
+      }
+      return ir_expr_ok(func);
+    }
+  case EX_INLINED:
+    {
+      Vector *args = expr->inlined.args;
+      for (int i = 0; i < args->len; ++i)
+        if (!ir_expr_ok(args->data[i]))
+          return false;
+      return ir_stmt_ok(expr->inlined.embedded);
+    }
+  case EX_COMPLIT:
+    return ir_stmts_ok(expr->complit.inits);
+  case EX_BLOCK:
+    return ir_stmt_ok(expr->block);
+  }
+  return false;
+}
+
+static bool ir_stmt_ok(Stmt *stmt) {
+  if (stmt == NULL)
+    return true;
+  switch (stmt->kind) {
+  case ST_EMPTY: case ST_BREAK: case ST_CONTINUE: case ST_GOTO:
+    return true;
+  case ST_EXPR:
+    return ir_expr_ok(stmt->expr);
+  case ST_BLOCK:
+    return ir_stmts_ok(stmt->block.stmts);
+  case ST_BLOCK_FOR_LABEL:
+    return ir_stmts_ok(stmt->block_for_label.stmts);
+  case ST_IF:
+    return ir_expr_ok(stmt->if_.cond) && ir_stmt_ok(stmt->if_.tblock) &&
+           ir_stmt_ok(stmt->if_.fblock);
+  case ST_SWITCH:
+    return ir_expr_ok(stmt->switch_.value) && ir_stmt_ok(stmt->switch_.body);
+  case ST_CASE:
+    return ir_stmt_ok(stmt->case_.stmt);
+  case ST_WHILE: case ST_DO_WHILE:
+    return ir_expr_ok(stmt->while_.cond) && ir_stmt_ok(stmt->while_.body);
+  case ST_FOR:
+    return ir_expr_ok(stmt->for_.pre) && ir_expr_ok(stmt->for_.cond) &&
+           ir_expr_ok(stmt->for_.post) && ir_stmt_ok(stmt->for_.body);
+  case ST_RETURN:
+    return ir_expr_ok(stmt->return_.val);
+  case ST_LABEL:
+    return ir_stmt_ok(stmt->label.stmt);
+  case ST_VARDECL:
+    return ir_stmt_ok(stmt->vardecl->init_stmt);
+  case ST_ASM:
+    return false;
+  }
+  return false;
+}
+
+static bool ir_eligible(Function *func) {
+  FuncInfo *finfo = table_get(&func_info_table, func->ident->ident);
+  FuncExtra *extra = func->extra;
+  if (finfo == NULL || (finfo->flag & FF_STACK_MODIFIED) || finfo->lspname != NULL ||
+      extra->setjmp_count > 0)
+    return false;
+  const Type *functype = func->type;
+  if (functype->func.vaargs)
+    return false;
+  const Type *rettype = functype->func.ret;
+  if (rettype->kind != TY_VOID && !ir_scalar_type(rettype))
+    return false;
+  const Vector *params = func->params;
+  for (int i = 0; params != NULL && i < params->len; ++i) {
+    const VarInfo *varinfo = params->data[i];
+    if (!ir_scalar_type(varinfo->type))
+      return false;
+  }
+  return ir_stmt_ok(func->body_block);
+}
+
 static void gen_defun(Function *func) {
   VarInfo *funcvi = scope_find(global_scope, func->ident->ident, NULL);
   if (is_function_omitted(funcvi, func->attributes))
@@ -934,6 +1149,15 @@ static void gen_defun(Function *func) {
   assert(extra != NULL);
   extra->code = code;
   func->extra = extra;
+
+  if (ir_eligible(func) && wir_gen_defun(func, code, extra->reloc_code)) {  // FPC
+    size_t before = code->len;
+    data_close_chunk(code, -1);
+    extra->offset = code->len - before;
+    return;
+  }
+  code->len = 0;
+
   uint32_t frame_size = allocate_local_variables(func, code);
 
   curfunc = func;

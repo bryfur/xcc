@@ -802,7 +802,7 @@ static bool narrow_operand_fits(VReg *x, VReg *v) {
 }
 
 static bool narrow_op_fits(IR *ir, VReg *v) {
-#if XCC_TARGET_ARCH == XCC_ARCH_ARM32
+#if XCC_TARGET_ARCH == XCC_ARCH_ARM32 || XCC_TARGET_ARCH == XCC_ARCH_WASM  // (narrow values kept extended to 32 bits: both)
   if (v->flag & (VRF_FLONUM | VRF_CONST) || v->vsize >= VRegSize4 || ir->dst->vsize > VRegSize4 ||
       (ir->dst->flag & VRF_FLONUM))
     return false;
@@ -900,7 +900,7 @@ static void coalesce_moves(RegAlloc *ra, BBContainer *bbcon) {
         // where it doesn't matter
         bool signonly = false;
         if (t->vsize != v->vsize) {
-#if XCC_TARGET_ARCH == XCC_ARCH_ARM32
+#if XCC_TARGET_ARCH == XCC_ARCH_ARM32 || XCC_TARGET_ARCH == XCC_ARCH_WASM  // (narrow values kept extended to 32 bits: both)
           VReg tmp = *v;
           tmp.vsize = t->vsize;
           tmp.flag = (tmp.flag & ~VRF_MASK) | (t->flag & VRF_MASK);
@@ -2244,7 +2244,7 @@ static bool fold_range_checks(RegAlloc *ra, BBContainer *bbcon) {
     // (x as it is: a narrow value is kept extended to 32 bits in its
     // register, ARM32)
     VReg *x4 = x;
-#if XCC_TARGET_ARCH != XCC_ARCH_ARM32
+#if XCC_TARGET_ARCH != XCC_ARCH_ARM32 && XCC_TARGET_ARCH != XCC_ARCH_WASM
     if (x->vsize != VRegSize4) {
       x4 = reg_alloc_spawn(ra, VRegSize4, VRF_UNSIGNED);
       vec_push(irs, new_ir_bop_raw(IR_CAST, x4, x, NULL));
@@ -2795,9 +2795,212 @@ static const char *pass_name[16];
 static int pass_on;
 static double pass_now(void);
 
+#if XCC_TARGET_ARCH == XCC_ARCH_WASM
+// FPC: wcc: WebAssembly's control flow is structured, a loop is entered at
+// its header only (wcc's code generator does an irreducible graph's
+// function).  The loops of the blocks as they are, to keep jump
+// threading's new edges from entering one elsewhere.
+typedef struct {
+  int nbb, nloops, words;
+  BB **headers;   // [nloops]
+  uint32_t *in;   // [nbb * words]: the loops each block is in
+  bool valid;
+} LoopInfo;
+
+static int li_succs(BB *bb, BB **out, int max) {
+  int n = 0;
+  IR *last = bb->irs->len > 0 ? bb->irs->data[bb->irs->len - 1] : NULL;
+  if (last != NULL && last->kind == IR_TJMP) {
+    for (size_t k = 0; k < last->tjmp.len && n < max; ++k)
+      out[n++] = last->tjmp.bbs[k];
+    return n;
+  }
+  if (last != NULL && last->kind == IR_JMP && last->jmp.cond != COND_NONE) {
+    out[n++] = last->jmp.bb;
+    if (last->jmp.cond == COND_ANY)
+      return n;
+  }
+  if (bb->next != NULL && n < max)
+    out[n++] = bb->next;
+  return n;
+}
+
+static void li_free(LoopInfo *li) {
+  free(li->headers);
+  free(li->in);
+  li->headers = NULL;
+  li->in = NULL;
+  li->valid = false;
+}
+
+static void li_compute(BBContainer *bbcon, LoopInfo *li) {
+  li_free(li);
+  int nbb = li->nbb = bbcon->len;
+  for (int i = 0; i < nbb; ++i)
+    ((BB*)bbcon->data[i])->index = i;
+  int maxs = 2;
+  for (int i = 0; i < nbb; ++i) {
+    BB *bb = bbcon->data[i];
+    IR *last = bb->irs->len > 0 ? bb->irs->data[bb->irs->len - 1] : NULL;
+    if (last != NULL && last->kind == IR_TJMP && (int)last->tjmp.len > maxs)
+      maxs = last->tjmp.len;
+  }
+  BB **sb = malloc_or_die(sizeof(*sb) * (maxs + 1));
+  int *rpo = malloc_or_die(sizeof(int) * nbb * 6 + 6);
+  int *byrpo = rpo + nbb, *idom = byrpo + nbb, *stk = idom + nbb, *post = stk + 2 * nbb;
+  for (int i = 0; i < nbb; ++i)
+    rpo[i] = idom[i] = -1;
+  // Postorder
+  char *seen = calloc_or_die(nbb + 1);
+  int sp = 0, npost = 0;
+  stk[sp++] = 0;
+  stk[sp++] = 0;
+  seen[0] = 1;
+  while (sp > 0) {
+    int b = stk[sp - 2], k = stk[sp - 1];
+    int ns = li_succs(bbcon->data[b], sb, maxs);
+    if (k < ns) {
+      stk[sp - 1] = k + 1;
+      int t = sb[k]->index;
+      if (t >= 0 && t < nbb && bbcon->data[t] == sb[k] && !seen[t]) {
+        seen[t] = 1;
+        stk[sp++] = t;
+        stk[sp++] = 0;
+      }
+    } else {
+      post[npost++] = b;
+      sp -= 2;
+    }
+  }
+  for (int i = 0; i < npost; ++i) {
+    rpo[post[npost - 1 - i]] = i;
+    byrpo[i] = post[npost - 1 - i];
+  }
+  // Predecessors (of reachable blocks)
+  Vector **preds = calloc_or_die(sizeof(*preds) * (nbb + 1));
+  for (int b = 0; b < nbb; ++b) {
+    preds[b] = new_vector();
+  }
+  for (int b = 0; b < nbb; ++b) {
+    if (rpo[b] < 0)
+      continue;
+    int ns = li_succs(bbcon->data[b], sb, maxs);
+    for (int k = 0; k < ns; ++k)
+      vec_push(preds[sb[k]->index], INT2VOIDP(b));
+  }
+  // Dominators
+  idom[0] = 0;
+  for (bool changed = true; changed; ) {
+    changed = false;
+    for (int i = 1; i < npost; ++i) {
+      int b = byrpo[i], nd = -1;
+      for (int k = 0; k < preds[b]->len; ++k) {
+        int p = VOIDP2INT(preds[b]->data[k]);
+        if (idom[p] < 0)
+          continue;
+        if (nd < 0) {
+          nd = p;
+        } else {
+          int x = p, y = nd;
+          while (x != y) {
+            while (rpo[x] > rpo[y]) x = idom[x];
+            while (rpo[y] > rpo[x]) y = idom[y];
+          }
+          nd = x;
+        }
+      }
+      if (nd >= 0 && idom[b] != nd) {
+        idom[b] = nd;
+        changed = true;
+      }
+    }
+  }
+  // Loops by header: the blocks that reach a back edge's source without
+  // the header
+  int *hloop = malloc_or_die(sizeof(int) * (nbb + 1));
+  int nloops = 0;
+  for (int b = 0; b < nbb; ++b) {
+    hloop[b] = -1;
+    if (rpo[b] < 0)
+      continue;
+    for (int k = 0; k < preds[b]->len; ++k) {
+      int p = VOIDP2INT(preds[b]->data[k]);
+      int d = p;
+      while (d != b && d != 0)
+        d = idom[d];
+      if (d == b && hloop[b] < 0)
+        hloop[b] = nloops++;
+    }
+  }
+  li->nloops = nloops;
+  li->words = (nloops + 31) / 32;
+  li->headers = malloc_or_die(sizeof(BB*) * (nloops + 1));
+  li->in = calloc_or_die(sizeof(uint32_t) * (nbb * li->words + 1));
+  int *work = malloc_or_die(sizeof(int) * (nbb + 1));
+  for (int h = 0; h < nbb; ++h) {
+    int l = hloop[h];
+    if (l < 0)
+      continue;
+    li->headers[l] = bbcon->data[h];
+    uint32_t bit = 1u << (l & 31);
+    int w = l >> 5;
+    li->in[h * li->words + w] |= bit;
+    int nw = 0;
+    for (int k = 0; k < preds[h]->len; ++k) {
+      int p = VOIDP2INT(preds[h]->data[k]);
+      int d = p;
+      while (d != h && d != 0)
+        d = idom[d];
+      if (d == h && !(li->in[p * li->words + w] & bit)) {
+        li->in[p * li->words + w] |= bit;
+        work[nw++] = p;
+      }
+    }
+    while (nw > 0) {
+      int x = work[--nw];
+      for (int k = 0; k < preds[x]->len; ++k) {
+        int p = VOIDP2INT(preds[x]->data[k]);
+        if (rpo[p] >= 0 && !(li->in[p * li->words + w] & bit)) {
+          li->in[p * li->words + w] |= bit;
+          work[nw++] = p;
+        }
+      }
+    }
+  }
+  free(work);
+  free(hloop);
+  for (int b = 0; b < nbb; ++b)
+    free_vector(preds[b]);
+  free(preds);
+  free(seen);
+  free(rpo);
+  free(sb);
+  li->valid = true;
+}
+
+// An edge from (the end of) src to dst: no loop entered elsewhere than at
+// its header
+static bool li_edge_ok(const LoopInfo *li, BB *src, BB *dst) {
+  int s = src->index, d = dst->index;
+  if (s < 0 || s >= li->nbb || d < 0 || d >= li->nbb)
+    return false;
+  for (int l = 0; l < li->nloops; ++l) {
+    uint32_t bit = 1u << (l & 31);
+    int w = l >> 5;
+    if ((li->in[d * li->words + w] & bit) && !(li->in[s * li->words + w] & bit) &&
+        li->headers[l] != dst)
+      return false;
+  }
+  return true;
+}
+#endif
+
 static bool thread_jumps(RegAlloc *ra, BBContainer *bbcon) {
   Thread th = {.ra = ra};
   vec_init(&th.undo);
+#if XCC_TARGET_ARCH == XCC_ARCH_WASM
+  LoopInfo li = {.valid = false};
+#endif
   bool changed = false;
   int nvregs = ra->vregs->len;
   int *uses = calloc_or_die(sizeof(*uses) * nvregs * 2);
@@ -2872,6 +3075,25 @@ static bool thread_jumps(RegAlloc *ra, BBContainer *bbcon) {
         thread_undo(&th, 0);
         continue;
       }
+#if XCC_TARGET_ARCH == XCC_ARCH_WASM
+      {  // (the new edges: the copied tests' other ways, the destination)
+        if (!li.valid)
+          li_compute(bbcon, &li);
+        bool ok = li_edge_ok(&li, p, th.best_dest);
+        for (int s = 0; s < th.best && ok; ++s) {
+          BB *bb = th.best_steps[s].bb;
+          IR *blast = bb->irs->len > 0 ? bb->irs->data[bb->irs->len - 1] : NULL;
+          int how = th.best_steps[s].how;
+          if ((how == 2 || how == 3) && blast != NULL && blast->kind == IR_JMP)
+            ok = li_edge_ok(&li, p, how == 2 ? blast->jmp.bb : bb->next);
+        }
+        if (!ok) {
+          thread_undo(&th, 0);
+          continue;
+        }
+        li.valid = false;  // (the blocks change)
+      }
+#endif
       // Where the copies go
       BB *cur, *after;
       int at;
@@ -2954,6 +3176,9 @@ static bool thread_jumps(RegAlloc *ra, BBContainer *bbcon) {
       // the predecessors: the caller finds them).
     }
   }
+#if XCC_TARGET_ARCH == XCC_ARCH_WASM
+  li_free(&li);
+#endif
   free_known_in_maps(kin, kin_len);
   free(known_buf);
   free(kmap_wanted);
@@ -3013,7 +3238,7 @@ static bool layout_jump_targets(BBContainer *bbcon) {
 // (narrow)x & c is x & c when c fits the narrow type (registers keep values
 // extended to 32 bits: ARM32)
 static void drop_masked_casts(RegAlloc *ra, BBContainer *bbcon) {
-#if XCC_TARGET_ARCH == XCC_ARCH_ARM32
+#if XCC_TARGET_ARCH == XCC_ARCH_ARM32 || XCC_TARGET_ARCH == XCC_ARCH_WASM  // (narrow values kept extended to 32 bits: both)
   int vreg_count = ra->vregs->len;
   int *uses = calloc_or_die(sizeof(*uses) * vreg_count * 2);
   int *defs = uses + vreg_count;
@@ -3315,9 +3540,11 @@ static double pass_now(void) {
   return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
+// (XCC_OPT_SKIP=mask: passes left out by their numbers, to find a miscompile)
+static unsigned pass_skip;
 #define TIMED(i, name, stmt)  do { \
     double t0_ = pass_on ? pass_now() : 0; \
-    stmt; \
+    if (!(pass_skip & (1u << (i)))) { stmt; } \
     if (pass_on) { pass_time[i] += pass_now() - t0_; pass_name[i] = name; } \
   } while (0)
 
@@ -3326,6 +3553,8 @@ void optimize(RegAlloc *ra, BBContainer *bbcon) {
   if (!pass_init) {
     pass_init = true;
     pass_on = getenv("XCC_PASS_TIME") != NULL;
+    const char *skip = getenv("XCC_OPT_SKIP");
+    pass_skip = skip != NULL ? strtoul(skip, NULL, 0) : 0;
     if (pass_on)
       atexit(print_pass_times);
   }
@@ -3354,7 +3583,7 @@ void optimize(RegAlloc *ra, BBContainer *bbcon) {
     TIMED(0, "coalesce", coalesce_moves(ra, bbcon));  // FPC
     TIMED(1, "masked", drop_masked_casts(ra, bbcon); bit_simplify(ra, bbcon));  // FPC
     TIMED(2, "cond_flow", cond_flow(ra, bbcon));  // FPC
-    bool threaded;
+    bool threaded = false;
     TIMED(3, "thread", threaded = thread_jumps(ra, bbcon));  // FPC
     if (threaded) {
       detect_from_bbs(bbcon);

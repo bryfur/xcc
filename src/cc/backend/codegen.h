@@ -7,6 +7,18 @@
 
 #include "ir.h"  // enum VRegSize
 
+#if XCC_TARGET_ARCH == XCC_ARCH_WASM
+// FPC: wcc links this code generator next to its own (src/wcc/wasm_ir.c):
+// these names are its own there
+#define gen                   be_gen
+#define gen_expr              be_gen_expr
+#define gen_stmt              be_gen_stmt
+#define gen_stmts             be_gen_stmts
+#define gen_clear_local_var   be_gen_clear_local_var
+#define add_builtin_function  be_add_builtin_function
+#define is_stack_param        be_is_stack_param
+#endif
+
 typedef struct BB BB;
 typedef struct Expr Expr;
 typedef struct Function Function;
