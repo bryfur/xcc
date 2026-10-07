@@ -542,6 +542,31 @@ static void emit_cast(WE *we, IR *ir) {
   uleb(we, sub);
 }
 
+// Arithmetic under 4 bytes is done in 32 bits: its result extended to its
+// size (as the ARM32 backend's tweak_irs casts it; a counter that does not
+// wrap, IR_ADD's bfx.nowrap, not)
+static void narrow_result(WE *we, IR *ir) {
+  VReg *dst = ir->dst;
+  if (dst == NULL || (dst->flag & VRF_FLONUM) || dst->vsize >= VRegSize4)
+    return;
+  switch (ir->kind) {
+  case IR_ADD:
+    if (ir->bfx.nowrap)
+      return;
+    break;
+  case IR_SUB: case IR_MUL: case IR_LSHIFT: case IR_NEG: case IR_BITNOT:
+    break;
+  default:
+    return;
+  }
+  if (dst->flag & VRF_UNSIGNED) {
+    op_i32(we, dst->vsize == VRegSize1 ? 0xff : 0xffff);
+    op(we, OP_I32_AND);
+  } else {
+    op(we, dst->vsize == VRegSize1 ? OP_I32_EXTEND8_S : OP_I32_EXTEND16_S);
+  }
+}
+
 static void emit_bop(WE *we, Vector *irs, int j) {
   IR *ir = irs->data[j];
   unsigned char wt = vreg_wt(ir->dst);
@@ -571,6 +596,7 @@ static void emit_bop(WE *we, Vector *irs, int j) {
   emit_operand(we, irs, j, ir->opr1, wt);
   emit_operand(we, irs, j, ir->opr2, wt);
   op(we, o);
+  narrow_result(we, ir);
 }
 
 static void emit_epilogue(WE *we) {
@@ -686,6 +712,7 @@ static void emit_ir(WE *we, Vector *irs, int j) {
         }
         emit_operand(we, irs, j, ir->opr1, wt);
         op(we, wt == WT_I64 ? OP_I64_SUB : OP_I32_SUB);
+        narrow_result(we, ir);
       }
     }
     break;
@@ -700,6 +727,7 @@ static void emit_ir(WE *we, Vector *irs, int j) {
       } else {
         op_i32(we, -1);
         op(we, OP_I32_XOR);
+        narrow_result(we, ir);
       }
     }
     break;

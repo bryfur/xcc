@@ -175,6 +175,28 @@ static void gen_arith(enum ExprKind kind, const Type *type) {
   ADD_CODE(kOpTable[u][index][kind - EX_ADD]);
 }
 
+// FPC: an operation in a type under 4 bytes (the frontend's compound
+// assignments: `u8 <<= n`, `s16 -= x`) is done in 32 bits: the result
+// wrapped to its type
+static void wrap_narrow(enum ExprKind kind, const Type *type) {
+  if (type->kind != TY_FIXNUM || type_size(type) >= I32_SIZE)
+    return;
+  switch (kind) {
+  case EX_ADD: case EX_SUB: case EX_MUL: case EX_LSHIFT: case EX_BITNOT:
+    break;
+  default:
+    return;
+  }
+  size_t d = type_size(type);
+  if (is_unsigned(type)) {
+    ADD_CODE(OP_I32_CONST);
+    ADD_LEB128((1U << (d * TARGET_CHAR_BIT)) - 1);
+    ADD_CODE(OP_I32_AND);
+  } else {
+    ADD_CODE(OP_I32_EXTEND8_S + most_significant_bit(d));
+  }
+}
+
 static void gen_cast_to_i(const Type *dst, Type *src) {
   switch (src->kind) {
   case TY_FIXNUM: case TY_PTR: case TY_FUNC:
@@ -813,8 +835,10 @@ static void gen_str(Expr *expr, bool needval) {
 static void gen_bop(Expr *expr, bool needval) {
   gen_expr(expr->bop.lhs, needval);
   gen_expr(expr->bop.rhs, needval);
-  if (needval)
+  if (needval) {
     gen_arith(expr->kind, expr->type);
+    wrap_narrow(expr->kind, expr->type);  // FPC
+  }
 }
 
 static void gen_relation(Expr *expr, bool needval) {
@@ -833,6 +857,7 @@ static void gen_neg(Expr *expr, bool needval) {
       ADD_LEB128(0);
       gen_expr(expr->unary.sub, true);
       gen_arith(EX_SUB, expr->type);
+      wrap_narrow(EX_SUB, expr->type);  // FPC
       break;
     case TY_FLONUM:
 #ifndef __NO_FLONUM
@@ -867,6 +892,7 @@ static void gen_bitnot(Expr *expr, bool needval) {
     }
     ADD_LEB128(-1);
     gen_arith(EX_BITXOR, expr->type);
+    wrap_narrow(EX_BITNOT, expr->type);  // FPC
   }
 }
 

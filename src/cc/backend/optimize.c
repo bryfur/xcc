@@ -3292,6 +3292,103 @@ static bool li_edge_ok(const LoopInfo *li, BB *src, BB *dst) {
 }
 #endif
 
+// FPC: full unrolling.  An innermost loop of one block entered only from
+// the block falling into it, whose counter starts there at a constant and
+// is stepped by a constant once in the loop and tested against a constant
+// at its end: the trip count known (at most UNROLL_TRIPS, the body small):
+// the body that many times, no test, no jump (a bit loop of a CRC).
+
+#define UNROLL_TRIPS  8
+#define UNROLL_IRS    64
+
+static bool unroll_small_loops(RegAlloc *ra, BBContainer *bbcon) {
+  bool changed = false;
+  int nvregs = ra->vregs->len;
+  int *uses = calloc_or_die(sizeof(*uses) * nvregs * 2 + 2);
+  int *defs = uses + nvregs;
+  count_vreg_uses(bbcon, uses, defs);
+  for (int i = 1; i < bbcon->len; ++i) {
+    BB *bb = bbcon->data[i], *pre = bbcon->data[i - 1];
+    Vector *irs = bb->irs;
+    if (irs->len < 2 || pre->next != bb)
+      continue;
+    IR *jmp = irs->data[irs->len - 1];
+    if (jmp->kind != IR_JMP || jmp->jmp.bb != bb || jmp->jmp.cond < COND_EQ ||
+        jmp->jmp.cond > COND_GT)
+      continue;
+    // its predecessors: itself and pre
+    bool only = true;
+    for (int k = 0; k < bb->from_bbs->len && only; ++k) {
+      BB *f = bb->from_bbs->data[k];
+      only = f == bb || f == pre;
+    }
+    if (!only)
+      continue;
+    VReg *iv = jmp->opr1, *bound = jmp->opr2;
+    if (iv == NULL || bound == NULL || (iv->flag & VRF_CONST) || !(bound->flag & VRF_CONST) ||
+        (bound->flag & VRF_FLONUM) || !plain_int_vreg(iv) || iv->vsize > VRegSize4)
+      continue;
+    // iv = iv + c once in the loop; the body copyable
+    int body = irs->len - 1, nset = 0;
+    int64_t c = 0;
+    bool ok = true;
+    for (int m = 0; m < body && ok; ++m) {
+      IR *ir = irs->data[m];
+      if (!thread_copyable(ir) || ir->kind == IR_JMP || ir->kind == IR_TJMP)
+        ok = false;
+      if (ir->dst == iv) {
+        ++nset;
+        if ((ir->kind != IR_ADD && ir->kind != IR_SUB) || ir->opr1 != iv ||
+            !(ir->opr2->flag & VRF_CONST) || (ir->opr2->flag & VRF_FLONUM))
+          ok = false;
+        else
+          c = ir->kind == IR_ADD ? ir->opr2->fixnum : -ir->opr2->fixnum;
+      }
+    }
+    if (!ok || nset != 1 || c == 0)
+      continue;
+    // iv on entry: a constant set in pre
+    int kd = def_index(pre->irs, pre->irs->len, iv);
+    IR *init = kd >= 0 ? pre->irs->data[kd] : NULL;
+    if (init == NULL || init->kind != IR_MOV || !(init->opr1->flag & VRF_CONST) ||
+        (init->opr1->flag & VRF_FLONUM))
+      continue;
+    // The trip count (iv in its width and sign)
+    int bits = 8 << iv->vsize;
+    bool uns = (iv->flag & VRF_UNSIGNED) != 0;
+    int64_t v = init->opr1->fixnum;
+    int n = 0;
+    for (;;) {
+      v += c;
+      uint64_t mask = bits >= 64 ? ~(uint64_t)0 : (((uint64_t)1 << bits) - 1);
+      v = uns ? (int64_t)((uint64_t)v & mask)
+              : (int64_t)(((uint64_t)v & mask) << (64 - bits)) >> (64 - bits);
+      ++n;
+      if (n > UNROLL_TRIPS)
+        break;
+      VReg ca = *iv, cb = *bound;
+      ca.flag = VRF_CONST | (iv->flag & VRF_UNSIGNED);
+      cb.flag = VRF_CONST | (iv->flag & VRF_UNSIGNED);
+      ca.fixnum = v;
+      cb.fixnum = bound->fixnum;
+      if (!calc_const_cond(jmp->jmp.cond, &ca, &cb))
+        break;
+    }
+    if (n > UNROLL_TRIPS || body * n > UNROLL_IRS)
+      continue;
+    vec_pop(irs);  // (the jump back)
+    for (int r = 1; r < n; ++r) {
+      int from = irs->len;
+      for (int m = 0; m < body; ++m)
+        vec_push(irs, copy_ir(irs->data[m]));
+      rename_local_temps(ra, irs, from, uses, defs, nvregs);
+    }
+    changed = true;
+  }
+  free(uses);
+  return changed;
+}
+
 static bool thread_jumps(RegAlloc *ra, BBContainer *bbcon) {
   Thread th = {.ra = ra};
   vec_init(&th.undo);
@@ -3958,6 +4055,13 @@ void optimize(RegAlloc *ra, BBContainer *bbcon) {
     TIMED(6, "coalesce2", coalesce_moves(ra, bbcon));  // FPC: what the passes above left
     TIMED(7, "unused", remove_unused_vregs(ra, bbcon));
     TIMED(8, "bbs", remove_unnecessary_bb(bbcon); detect_from_bbs(bbcon));
+    bool unrolled = false;
+    TIMED(13, "unroll", unrolled = unroll_small_loops(ra, bbcon));  // FPC
+    if (unrolled) {
+      detect_from_bbs(bbcon);
+      merge_blocks(bbcon);
+      detect_from_bbs(bbcon);
+    }
     TIMED(9, "licm", hoist_loop_invariants(ra, bbcon));  // FPC
     TIMED(10, "coalesce3", coalesce_moves(ra, bbcon); coalesce_across_fall(ra, bbcon));  // FPC: the loads made MOVs
 #if XCC_TARGET_ARCH == XCC_ARCH_WASM
