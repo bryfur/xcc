@@ -200,7 +200,12 @@ static VReg *gen_cast(Expr *expr) {
   if (vreg->flag & VRF_CONST) {
     assert(!(vreg->flag & VRF_FLONUM));  // No const vreg for flonum.
     Fixnum value = vreg->fixnum;
-    if (dst_size < (1U << vreg->vsize) && dst_size < sizeof(Fixnum)) {
+    if (dst_type->kind == TY_FIXNUM && dst_size < sizeof(Fixnum)) {
+      // FPC: to the type's width and sign whatever the source's (0xffff0000u
+      // cast to int is -65536: a signed constant's value is sign-extended;
+      // a fuzz program's `(int)((z & 0u) - 65536u) % 15` came out 0)
+      value = wrap_value(value, dst_size, is_unsigned(dst_type));
+    } else if (dst_size < (1U << vreg->vsize) && dst_size < sizeof(Fixnum)) {
       // Assume that integer is represented in Two's complement
       size_t bit = dst_size * TARGET_CHAR_BIT;
       UFixnum mask = ~(UFixnum)0 << bit;  // FPC: was -1UL (32 bits on a 32-bit host)

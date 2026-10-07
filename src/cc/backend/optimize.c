@@ -483,6 +483,10 @@ static bool constant_folding(RegAlloc *ra, IR *ir) {
           value = ir->opr1->fixnum;
           if (ir->dst->vsize > ir->opr1->vsize)
             value = wrap_value(value, 1 << ir->opr1->vsize, ir->opr1->flag & VRF_UNSIGNED);
+          // FPC: and as the result's type has it (unsigned 0xffff0000 cast to
+          // int is -65536: a signed constant's value is sign-extended; a
+          // fuzz program's `(int32_t)(u - 65536u) % 15` folded to 0)
+          value = wrap_value(value, 1 << ir->dst->vsize, ir->dst->flag & VRF_UNSIGNED);
         }
         // Replace to MOV.
         ir->kind = IR_MOV;
@@ -3389,6 +3393,152 @@ static bool unroll_small_loops(RegAlloc *ra, BBContainer *bbcon) {
   return changed;
 }
 
+// The same for an innermost loop of a few blocks (a branch in its body:
+// CoreMark's CRC), its blocks one after another, entered only at its head
+// from the block before, its counter stepped in the latch: the blocks
+// copied that many times, jumps between them to the same copy's, each
+// copy's latch falling into the next copy's head.
+
+#define UNROLL_MULTI_BBS  6
+#define UNROLL_MULTI_IRS  128
+
+static int unroll_trips(VReg *iv, int64_t start, int64_t c, int cond, VReg *bound) {
+  int bits = 8 << iv->vsize;
+  bool uns = (iv->flag & VRF_UNSIGNED) != 0;
+  int64_t v = start;
+  int n = 0;
+  for (;;) {
+    v += c;
+    uint64_t mask = bits >= 64 ? ~(uint64_t)0 : (((uint64_t)1 << bits) - 1);
+    v = uns ? (int64_t)((uint64_t)v & mask)
+            : (int64_t)(((uint64_t)v & mask) << (64 - bits)) >> (64 - bits);
+    ++n;
+    if (n > UNROLL_TRIPS)
+      return n;
+    VReg ca = *iv, cb = *bound;
+    ca.flag = VRF_CONST | (iv->flag & VRF_UNSIGNED);
+    cb.flag = VRF_CONST | (iv->flag & VRF_UNSIGNED);
+    ca.fixnum = v;
+    cb.fixnum = bound->fixnum;
+    if (!calc_const_cond(cond, &ca, &cb))
+      return n;
+  }
+}
+
+static bool unroll_multi_block_loops(RegAlloc *ra, BBContainer *bbcon) {
+  bool changed = false;
+  for (int j = 2; j < bbcon->len; ++j) {
+    BB *latch = bbcon->data[j];
+    Vector *lirs = latch->irs;
+    IR *jmp = lirs->len > 0 ? lirs->data[lirs->len - 1] : NULL;
+    if (jmp == NULL || jmp->kind != IR_JMP || jmp->jmp.cond < COND_EQ || jmp->jmp.cond > COND_GT)
+      continue;
+    int h = bb_index(bbcon, jmp->jmp.bb);
+    if (h <= 0 || h >= j || j - h + 1 > UNROLL_MULTI_BBS)
+      continue;
+    BB *head = bbcon->data[h], *pre = bbcon->data[h - 1];
+    if (pre->next != head)
+      continue;
+    // One way in (the head, from pre), no other loop in it, no table jumps
+    // or calls; the blocks' falls stay in it but for the latch's
+    bool ok = true;
+    int nirs = 0;
+    for (int k = h; k <= j && ok; ++k) {
+      BB *b = bbcon->data[k];
+      for (int f = 0; f < b->from_bbs->len && ok; ++f) {
+        BB *q = b->from_bbs->data[f];
+        int qi = bb_index(bbcon, q);
+        if (!(qi >= h && qi <= j) && !(k == h && q == pre))
+          ok = false;
+      }
+      if (k < j && b->next != bbcon->data[k + 1])
+        ok = false;
+      for (int m = 0; m < b->irs->len && ok; ++m) {
+        IR *ir = b->irs->data[m];
+        if (!thread_copyable(ir) && ir->kind != IR_JMP)
+          ok = false;
+        if (ir->kind == IR_JMP && ir != jmp) {
+          int t = bb_index(bbcon, ir->jmp.bb);
+          if (t >= h && t <= k)  // (backward inside: another loop)
+            ok = false;
+        }
+      }
+      nirs += b->irs->len;
+    }
+    if (!ok)
+      continue;
+    VReg *iv = jmp->opr1, *bound = jmp->opr2;
+    if (iv == NULL || bound == NULL || (iv->flag & VRF_CONST) || !(bound->flag & VRF_CONST) ||
+        (bound->flag & VRF_FLONUM) || !plain_int_vreg(iv) || iv->vsize > VRegSize4)
+      continue;
+    // iv = iv + c once, in the latch
+    int nset = 0;
+    int64_t c = 0;
+    for (int k = h; k <= j && ok; ++k) {
+      Vector *irs = ((BB*)bbcon->data[k])->irs;
+      for (int m = 0; m < irs->len && ok; ++m) {
+        IR *ir = irs->data[m];
+        if (ir->dst != iv)
+          continue;
+        ++nset;
+        if (k != j || (ir->kind != IR_ADD && ir->kind != IR_SUB) || ir->opr1 != iv ||
+            !(ir->opr2->flag & VRF_CONST) || (ir->opr2->flag & VRF_FLONUM))
+          ok = false;
+        else
+          c = ir->kind == IR_ADD ? ir->opr2->fixnum : -ir->opr2->fixnum;
+      }
+    }
+    if (!ok || nset != 1 || c == 0)
+      continue;
+    int kd = def_index(pre->irs, pre->irs->len, iv);
+    IR *init = kd >= 0 ? pre->irs->data[kd] : NULL;
+    if (init == NULL || init->kind != IR_MOV || !(init->opr1->flag & VRF_CONST) ||
+        (init->opr1->flag & VRF_FLONUM))
+      continue;
+    int n = unroll_trips(iv, init->opr1->fixnum, c, jmp->jmp.cond, bound);
+    if (n > UNROLL_TRIPS || (nirs - 1) * n > UNROLL_MULTI_IRS)
+      continue;
+
+    int nb = j - h + 1;
+    int nvregs = ra->vregs->len;
+    int *uses = calloc_or_die(sizeof(*uses) * nvregs * 2 + 2);
+    int *defs = uses + nvregs;
+    count_vreg_uses(bbcon, uses, defs);
+    vec_pop(lirs);  // (the jump back: the latch falls into the next copy)
+    BB *exit = latch->next;
+    BB *prev_latch = latch;
+    int at = j + 1;
+    BB **cp = malloc_or_die(sizeof(*cp) * nb);
+    for (int r = 1; r < n; ++r) {
+      for (int k = 0; k < nb; ++k)
+        cp[k] = new_bb();
+      for (int k = 0; k < nb; ++k) {
+        BB *orig = bbcon->data[h + k];
+        for (int m = 0; m < orig->irs->len; ++m) {
+          IR *x = copy_ir(orig->irs->data[m]);
+          if (x->kind == IR_JMP) {
+            int t = bb_index(bbcon, x->jmp.bb);
+            if (t >= h && t <= j)
+              x->jmp.bb = cp[t - h];
+          }
+          vec_push(cp[k]->irs, x);
+        }
+        rename_local_temps(ra, cp[k]->irs, 0, uses, defs, nvregs);
+        cp[k]->next = k + 1 < nb ? cp[k + 1] : exit;
+      }
+      prev_latch->next = cp[0];
+      prev_latch = cp[nb - 1];
+      for (int k = 0; k < nb; ++k)
+        vec_insert(bbcon, at++, cp[k]);
+    }
+    free(cp);
+    free(uses);
+    changed = true;
+    j = at - 1;
+  }
+  return changed;
+}
+
 static bool thread_jumps(RegAlloc *ra, BBContainer *bbcon) {
   Thread th = {.ra = ra};
   vec_init(&th.undo);
@@ -4056,7 +4206,8 @@ void optimize(RegAlloc *ra, BBContainer *bbcon) {
     TIMED(7, "unused", remove_unused_vregs(ra, bbcon));
     TIMED(8, "bbs", remove_unnecessary_bb(bbcon); detect_from_bbs(bbcon));
     bool unrolled = false;
-    TIMED(13, "unroll", unrolled = unroll_small_loops(ra, bbcon));  // FPC
+    TIMED(13, "unroll", unrolled = unroll_small_loops(ra, bbcon) |
+                                   unroll_multi_block_loops(ra, bbcon));  // FPC
     if (unrolled) {
       detect_from_bbs(bbcon);
       merge_blocks(bbcon);
