@@ -924,37 +924,68 @@ static inline void epilogue(Function *func, uint32_t frame_size, Expr *bpvar, Ex
 
 // FPC: functions through xcc's IR and optimiser (wasm_ir.c)
 
-static void push_reloc(Function *func, int type, uint32_t index, uint32_t offset) {
-  FuncExtra *extra = func->extra;
+static void push_reloc(Vector *relocs, int type, uint32_t index, uint32_t offset) {
   RelocInfo *ri = calloc_or_die(sizeof(*ri));
   ri->type = type;
   ri->offset = offset;
   ri->addend = 0;
   ri->index = index;
-  vec_push(extra->reloc_code, ri);
+  vec_push(relocs, ri);
 }
 
-bool wir_global_addr(Function *func, DataStorage *code, const Name *label) {
+typedef struct {
+  int32_t type;
+  uint32_t offset, index;
+  int32_t addend;
+} PackedReloc;
+
+size_t wir_relocs_size(Vector *relocs) {
+  return sizeof(PackedReloc) * relocs->len;
+}
+
+void wir_relocs_save(Vector *relocs, void *dst, uint32_t delta) {
+  for (int i = 0; i < relocs->len; ++i) {
+    RelocInfo *ri = relocs->data[i];
+    PackedReloc pr = {.type = ri->type, .offset = ri->offset + delta, .index = ri->index,
+                      .addend = ri->addend};
+    memcpy((char*)dst + i * sizeof(pr), &pr, sizeof(pr));
+  }
+}
+
+void wir_relocs_restore(const void *src, size_t size, Vector *relocs) {
+  for (size_t i = 0; i < size / sizeof(PackedReloc); ++i) {
+    PackedReloc pr;
+    memcpy(&pr, (const char*)src + i * sizeof(pr), sizeof(pr));
+    RelocInfo *ri = calloc_or_die(sizeof(*ri));
+    ri->type = pr.type;
+    ri->offset = pr.offset;
+    ri->index = pr.index;
+    ri->addend = pr.addend;
+    vec_push(relocs, ri);
+  }
+}
+
+bool wir_global_addr(Vector *relocs, DataStorage *code, const Name *label) {
   GVarInfo *gvinfo = get_gvar_info_from_name(label);
   if (gvinfo != NULL) {
-    if (equal_name(label, alloc_cname(SP_NAME)))
+    if ((size_t)label->bytes == strlen(SP_NAME) && memcmp(label->chars, SP_NAME, label->bytes) == 0)
       return false;
     data_push(code, OP_I32_CONST);
-    push_reloc(func, R_WASM_MEMORY_ADDR_SLEB, gvinfo->symbol_index, code->len);
+    push_reloc(relocs, R_WASM_MEMORY_ADDR_SLEB, gvinfo->symbol_index, code->len);
     data_varint32(code, -1, gvinfo->non_prim.address);
     return true;
   }
   FuncInfo *finfo = table_get(&indirect_function_table, label);
   if (finfo != NULL && finfo->indirect_index > 0) {
     data_push(code, OP_I32_CONST);
-    push_reloc(func, R_WASM_TABLE_INDEX_SLEB, finfo->index, code->len);
+    push_reloc(relocs, R_WASM_TABLE_INDEX_SLEB, finfo->index, code->len);
     data_varint32(code, -1, finfo->indirect_index);
     return true;
   }
   return false;
 }
 
-bool wir_call(Function *func, DataStorage *code, const Name *label) {
+bool wir_call(Vector *relocs, DataStorage *code, const Name *label) {
   FuncInfo *finfo = table_get(&func_info_table, label);
   if (finfo == NULL || finfo->varinfo == NULL)
     return false;
@@ -966,42 +997,46 @@ bool wir_call(Function *func, DataStorage *code, const Name *label) {
       return false;
   }
   data_push(code, OP_CALL);
-  push_reloc(func, R_WASM_FUNCTION_INDEX_LEB, finfo->index, code->len);
+  push_reloc(relocs, R_WASM_FUNCTION_INDEX_LEB, finfo->index, code->len);
   data_varuint32(code, -1, target->index);
   return true;
 }
 
-bool wir_call_indirect(Function *func, DataStorage *code, const Type *functype) {
+bool wir_call_indirect(Vector *relocs, DataStorage *code, const Type *functype) {
   int index = get_func_type_index(functype);
   if (index < 0)
     return false;
-  TableInfo *ti = getsert_indirect_function_table();
+  // (the table there already: traverse.c made it for the call; nothing
+  // made here, in wasm_ir.c's arena window)
+  TableInfo *ti = NULL;
+  size_t tlen = strlen(INDIRECT_FUNCALL_TABLE_NAME);
+  for (int i = 0; i < tables->len && ti == NULL; ++i) {
+    TableInfo *t = tables->data[i];
+    if ((size_t)t->name->bytes == tlen && memcmp(t->name->chars, INDIRECT_FUNCALL_TABLE_NAME, tlen) == 0)
+      ti = t;
+  }
+  if (ti == NULL)
+    return false;
   data_push(code, OP_CALL_INDIRECT);
-  push_reloc(func, R_WASM_TYPE_INDEX_LEB, index, code->len);
+  push_reloc(relocs, R_WASM_TYPE_INDEX_LEB, index, code->len);
   data_varuint32(code, -1, index);
-  push_reloc(func, R_WASM_TABLE_NUMBER_LEB, ti->symbol_index, code->len);
+  push_reloc(relocs, R_WASM_TABLE_NUMBER_LEB, ti->symbol_index, code->len);
   data_varuint32(code, -1, ti->index);
   return true;
 }
 
-bool wir_sp(Function *func, DataStorage *code, bool set) {
-  GVarInfo *gvinfo = get_gvar_info_from_name(alloc_cname(SP_NAME));
+static const Name *s_spname;  // (interned before wasm_ir.c's arena window)
+
+bool wir_sp(Vector *relocs, DataStorage *code, bool set) {
+  if (s_spname == NULL)
+    return false;
+  GVarInfo *gvinfo = get_gvar_info_from_name(s_spname);
   if (gvinfo == NULL)
     return false;
   data_push(code, set ? OP_GLOBAL_SET : OP_GLOBAL_GET);
-  push_reloc(func, R_WASM_GLOBAL_INDEX_LEB, gvinfo->symbol_index, code->len);
+  push_reloc(relocs, R_WASM_GLOBAL_INDEX_LEB, gvinfo->symbol_index, code->len);
   data_varuint32(code, -1, gvinfo->prim.index);
   return true;
-}
-
-void wir_relocs_shift(Vector *relocs, int from, uint32_t delta) {
-  for (int i = from; i < relocs->len; ++i)
-    ((RelocInfo*)relocs->data[i])->offset += delta;
-}
-
-void wir_relocs_drop(Vector *relocs, int from) {
-  while (relocs->len > from)
-    free(vec_pop(relocs));
 }
 
 // What xcc's IR code generator does as wcc does: scalars in and out of
@@ -1044,8 +1079,13 @@ static bool ir_expr_ok(Expr *expr) {
     {
       Expr *func = expr->funcall.func;
       if (func->kind == EX_VAR && is_global_scope(func->var.scope) &&
-          table_try_get(&builtin_function_table, func->var.name, NULL))
-        return false;
+          table_try_get(&builtin_function_table, func->var.name, NULL)) {
+        // (alloca: the IR's own, IR_SUBSP)
+        if (!equal_name(func->var.name, alloc_cname("alloca")) || expr->funcall.args->len != 1)
+          return false;
+        Expr *arg = expr->funcall.args->data[0];
+        return ir_scalar_type(arg->type) && ir_expr_ok(arg);
+      }
       const Type *functype = get_callee_type(func->type);
       if (functype == NULL || functype->func.vaargs || functype->func.params == NULL)
         return false;
@@ -1118,8 +1158,7 @@ static bool ir_stmt_ok(Stmt *stmt) {
 static bool ir_eligible(Function *func) {
   FuncInfo *finfo = table_get(&func_info_table, func->ident->ident);
   FuncExtra *extra = func->extra;
-  if (finfo == NULL || (finfo->flag & FF_STACK_MODIFIED) || finfo->lspname != NULL ||
-      extra->setjmp_count > 0)
+  if (finfo == NULL || finfo->lspname != NULL || extra->setjmp_count > 0)
     return false;
   const Type *functype = func->type;
   if (functype->func.vaargs)
@@ -1150,7 +1189,12 @@ static void gen_defun(Function *func) {
   extra->code = code;
   func->extra = extra;
 
-  if (ir_eligible(func) && wir_gen_defun(func, code, extra->reloc_code)) {  // FPC
+  if (s_spname == NULL)
+    s_spname = alloc_cname(SP_NAME);
+  bool eligible = ir_eligible(func);
+  if (!eligible && getenv("WCC_IRLIST") != NULL)
+    fprintf(stderr, "ir %.*s: not eligible\n", NAMES(func->ident->ident));
+  if (eligible && wir_gen_defun(func, code, extra->reloc_code)) {  // FPC
     size_t before = code->len;
     data_close_chunk(code, -1);
     extra->offset = code->len - before;

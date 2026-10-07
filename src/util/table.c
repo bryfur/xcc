@@ -38,6 +38,23 @@ static const Name *find_name_table(const char *chars, int bytes, uint32_t hash) 
   }
 }
 
+// FPC: a name of its own, not in the name table (unique by its spelling
+// anyway, nothing looks it up: a block's label; wcc frees a function's IR
+// whole, the table keeps nothing of it)
+const Name *alloc_name_uninterned(const char *begin, const char *end) {
+  int bytes = end != NULL ? (int)(end - begin) : (int)strlen(begin);
+  char *str = malloc(bytes + 1);
+  Name *name = malloc(sizeof(*name));
+  if (str == NULL || name == NULL)
+    return NULL;
+  memcpy(str, begin, bytes);
+  str[bytes] = '\0';
+  name->chars = str;
+  name->bytes = bytes;
+  name->hash = hash_string(begin, bytes);
+  return name;
+}
+
 const Name *alloc_name(const char *begin, const char *end, bool make_copy) {
   int bytes = end != NULL ? (int)(end - begin) : (int)strlen(begin);
   uint32_t hash = hash_string(begin, bytes);

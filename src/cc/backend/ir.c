@@ -392,7 +392,11 @@ BB *new_bb(void) {
   BB *bb = calloc_or_die(sizeof(*bb));
   bb->next = NULL;
   bb->from_bbs = new_vector();
+#if XCC_TARGET_ARCH == XCC_ARCH_WASM
+  bb->label = alloc_label_uninterned();  // FPC: wcc frees a function's IR whole
+#else
   bb->label = alloc_label();
+#endif
   bb->irs = new_vector();
   bb->in_regs = new_vector();
   bb->out_regs = new_vector();

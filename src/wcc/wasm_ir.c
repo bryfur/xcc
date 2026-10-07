@@ -78,6 +78,7 @@ typedef struct {
   Function *func;
   FuncBackend *fnbe;
   DataStorage *code;
+  Vector *relocs;    // the relocations of code
   BBContainer *bbcon;
   int nbb;
   int *rpo;        // [nbb] reverse postorder number (-1: unreachable)
@@ -106,6 +107,7 @@ typedef struct {
   char *folded;
   int cap_folded;
   unsigned char last_op;
+  bool has_subsp;  // alloca: the stack pointer back from the frame pointer at the end
   bool tail_returned;  // the function's end: the result pushed last
   bool fail;
 } WE;
@@ -299,7 +301,7 @@ static int ir_operands(IR *ir, VReg **ops, int max) {
       ADD(ir->opr1); ADD(ir->opr2);
     }
     break;
-  case IR_NEG: case IR_BITNOT: case IR_CAST: case IR_MOV: case IR_TJMP:
+  case IR_NEG: case IR_BITNOT: case IR_CAST: case IR_MOV: case IR_TJMP: case IR_SUBSP:
     ADD(ir->opr1); break;
   case IR_RESULT:
     if (ir->opr1 != NULL)
@@ -580,11 +582,13 @@ static void emit_bop(WE *we, Vector *irs, int j) {
 }
 
 static void emit_epilogue(WE *we) {
-  if (we->frame_size > 0) {
+  if (we->fp >= 0) {
     op_local(we, OP_LOCAL_GET, we->fp);
-    op_i32(we, we->frame_size);
-    op(we, OP_I32_ADD);
-    if (!wir_sp(we->func, we->code, true))
+    if (we->frame_size > 0) {
+      op_i32(we, we->frame_size);
+      op(we, OP_I32_ADD);
+    }
+    if (!wir_sp(we->relocs, we->code, true))
       we_fail(we);
   }
 }
@@ -610,7 +614,7 @@ static void emit_ir(WE *we, Vector *irs, int j) {
     }
     break;
   case IR_IOFS:
-    if (!wir_global_addr(we->func, we->code, ir->iofs.label)) {
+    if (!wir_global_addr(we->relocs, we->code, ir->iofs.label)) {
       we_fail(we);
       break;
     }
@@ -751,11 +755,11 @@ static void emit_ir(WE *we, Vector *irs, int j) {
       if (we->fail)
         break;
       if (call->label != NULL) {
-        if (!wir_call(we->func, we->code, call->label))
+        if (!wir_call(we->relocs, we->code, call->label))
           we_fail(we);
       } else {
         emit_operand(we, irs, j, ir->opr1, WT_I32);
-        if (!wir_call_indirect(we->func, we->code, ft))
+        if (!wir_call_indirect(we->relocs, we->code, ft))
           we_fail(we);
       }
       we->last_op = OP_CALL;
@@ -773,6 +777,20 @@ static void emit_ir(WE *we, Vector *irs, int j) {
     }
     break;
   case IR_KEEP:
+    break;
+  case IR_SUBSP:  // sp -= opr1; dst = sp
+    if (we->fp < 0 || !wir_sp(we->relocs, we->code, false)) {
+      we_fail(we);
+      break;
+    }
+    emit_operand(we, irs, j, ir->opr1, WT_I32);
+    op(we, OP_I32_SUB);
+    if (dst != NULL) {
+      op_local(we, OP_LOCAL_TEE, vreg_local(we, dst));
+      dst = NULL;  // (set here)
+    }
+    if (!wir_sp(we->relocs, we->code, true))
+      we_fail(we);
     break;
   default:
     we_fail(we);
@@ -1290,6 +1308,8 @@ static void count_vregs(WE *we) {
       int n = ir_operands(ir, ops, MAX_OPS);
       if (ir->kind == IR_CALL && n >= MAX_OPS)
         we_fail(we);
+      if (ir->kind == IR_SUBSP)
+        we->has_subsp = true;
       for (int k = 0; k < n; ++k) {
         VReg *v = ops[k];
         if (v != NULL && !(v->flag & VRF_CONST) && v->virt >= 0 && v->virt < we->nvirt)
@@ -1698,16 +1718,20 @@ static bool emit_function(WE *we) {
   lay_out_frame(we);
   if (we->fail)
     return false;
-  if (we->frame_size > 0) {
+  if (we->frame_size > 0 || we->has_subsp) {
     we->fp = new_local(we, WT_I32);
-    // fp = sp - size; sp = fp
-    if (!wir_sp(func, we->code, false))
+    // fp = sp - size; sp = fp (alloca: sp back to fp + size at the end)
+    if (!wir_sp(we->relocs, we->code, false))
       return false;
-    op_i32(we, we->frame_size);
-    op(we, OP_I32_SUB);
-    op_local(we, OP_LOCAL_TEE, we->fp);
-    if (!wir_sp(func, we->code, true))
-      return false;
+    if (we->frame_size > 0) {
+      op_i32(we, we->frame_size);
+      op(we, OP_I32_SUB);
+      op_local(we, OP_LOCAL_TEE, we->fp);
+      if (!wir_sp(we->relocs, we->code, true))
+        return false;
+    } else {
+      op_local(we, OP_LOCAL_SET, we->fp);
+    }
     // Address-taken parameters to their places in the frame
     for (int i = 0; i < we->nparams; ++i) {
       VarInfo *vi = params->data[i];
@@ -1795,16 +1819,36 @@ static void dump_function(Function *func, BBContainer *bbcon) {
   }
 }
 
+#if defined(__NuttX__)  // (xcc_nuttx.c's arena)
+#define ARENA_USED()  xcc_arena_used()
+#define ARENA_MARK(m)  struct xcc_arena_mark_s m; xcc_arena_mark(&m)
+#define ARENA_RELEASE(m)  xcc_arena_release(&m)
+#else
+#define ARENA_USED()  ((size_t)0)
+#define ARENA_MARK(m)  do {} while (0)
+#define ARENA_RELEASE(m)  do {} while (0)
+#endif
+
 static bool compile_ir(Function *func, DataStorage *code, Vector *relocs) {
   void *wcc_extra = func->extra;
   bool ok = false;
+  static int arena_stats = -1;
+  if (arena_stats < 0)
+    arena_stats = getenv("WCC_ARENA") != NULL;
+  size_t a0 = arena_stats ? ARENA_USED() : 0, a1 = 0, a2 = 0;
+  // The function's IR in a window of the arena: given back whole at the
+  // end (what is kept: in a large block, copied out after)
+  ARENA_MARK(mark);
   if (!gen_defun(func)) {
     func->extra = wcc_extra;
+    ARENA_RELEASE(mark);
     return false;
   }
   FuncBackend *fnbe = func->extra;
   curfunc = func;
   curra = fnbe->ra;
+  if (arena_stats)
+    a1 = ARENA_USED();
   if (getenv("WCC_NOOPTIM") == NULL)
     optimize(fnbe->ra, fnbe->bbcon);
   else
@@ -1814,6 +1858,8 @@ static bool compile_ir(Function *func, DataStorage *code, Vector *relocs) {
     analyze_reg_flow(fnbe->bbcon);
   curra = NULL;
   curfunc = NULL;
+  if (arena_stats)
+    a2 = ARENA_USED();
   {
     static int dump = -1;
     if (dump < 0)
@@ -1840,13 +1886,12 @@ static bool compile_ir(Function *func, DataStorage *code, Vector *relocs) {
   we.fnbe = fnbe;
   we.fp = we.rv = -1;
   we.frames = new_vector();
+  we.relocs = new_vector();
 
   // Body first (its locals known at the end), the declarations then
   DataStorage body;
   data_init(&body);
   we.code = &body;
-  // (relocations: offsets in the body for now)
-  int nrel0 = relocs->len;
   // (WCC_IRFAIL=1: every function through the IR code generator and the
   // optimiser, then wcc's own code generator after all: a test that the
   // first leaves the syntax tree as wcc's wants it)
@@ -1856,6 +1901,9 @@ static bool compile_ir(Function *func, DataStorage *code, Vector *relocs) {
     irfail = e != NULL && *e == '1';
   }
   ok = !irfail && emit_function(&we);
+  char *out = NULL;
+  size_t ncode = 0, nrel = 0;
+  uint32_t nparams = we.nparams, nlocals = we.nlocals;
   if (ok) {
     DataStorage head;
     data_init(&head);
@@ -1873,21 +1921,27 @@ static bool compile_ir(Function *func, DataStorage *code, Vector *relocs) {
       data_push(&head, we.ltype[i]);
       i = k;
     }
-    // (the relocations wir_* made point into the body)
-    wir_relocs_shift(relocs, nrel0, head.len);
-    data_append(code, head.buf, head.len);
-    data_append(code, body.buf, body.len);
-    data_release(&head);
-    wasm_opt_func(code, relocs, we.ltype, we.nparams);
-  } else {
-    wir_relocs_drop(relocs, nrel0);  // (what this attempt added)
+    // [declarations][body][relocations (offsets past the declarations)][types]
+    ncode = head.len + body.len;
+    nrel = wir_relocs_size(we.relocs);
+    size_t total = ncode + nrel + nlocals;
+    out = malloc_or_die(total > 1024 ? total : 1024);  // (large: outlives the window)
+    memcpy(out, head.buf, head.len);
+    memcpy(out + head.len, body.buf, body.len);
+    wir_relocs_save(we.relocs, out + ncode, head.len);
+    memcpy(out + ncode + nrel, we.ltype, nlocals);
   }
-  data_release(&body);
+  if (arena_stats)
+    fprintf(stderr, "arena %.*s: gen %zu, optimize %zu, emit %zu\n", NAMES(func->ident->ident),
+            a1 - a0, a2 - a1, ARENA_USED() - a2);
+  ARENA_RELEASE(mark);
 
-  free(we.rpo); free(we.byrpo); free(we.idom); free(we.header); free(we.merge);
-  free(we.kids); free(we.kid_start); free(we.local); free(we.uses); free(we.defs);
-  free(we.ltype); free(we.ctx); free(we.folded);
-  free_vector(we.frames);
+  if (ok) {
+    data_append(code, out, ncode);
+    wir_relocs_restore(out + ncode, nrel, relocs);
+    wasm_opt_func(code, relocs, (unsigned char*)out + ncode + nrel, nparams);
+    free(out);
+  }
   return ok;
 }
 

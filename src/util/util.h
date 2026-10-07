@@ -33,6 +33,7 @@ void *malloc_or_die(size_t size);
 void *calloc_or_die(size_t size);  // No `count` argument.
 void *realloc_or_die(void *ptr, size_t size);
 const Name *alloc_label(void);
+const Name *alloc_label_uninterned(void);  // FPC
 ssize_t getline_chomp(char **lineptr, size_t *n, FILE *stream);
 ssize_t getline_cont(char **lineptr, size_t *n, FILE *stream, int *plineno);
 bool is_fullpath(const char *filename);

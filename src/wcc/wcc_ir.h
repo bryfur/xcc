@@ -19,14 +19,17 @@ typedef struct Vector Vector;
 bool wir_gen_defun(Function *func, DataStorage *code, Vector *relocs);
 
 // gen_wasm.c: instructions that need wcc's tables and relocations, added
-// to code (their relocations to func's, at offsets in code; func->extra is
-// wcc's then).  false: not known.
-bool wir_global_addr(Function *func, DataStorage *code, const Name *label);  // i32.const <address or table index>
-bool wir_call(Function *func, DataStorage *code, const Name *label);  // call <function>
-bool wir_call_indirect(Function *func, DataStorage *code, const Type *functype);  // call_indirect <type> <table>
-bool wir_sp(Function *func, DataStorage *code, bool set);  // global.get/set __stack_pointer
-void wir_relocs_shift(Vector *relocs, int from, uint32_t delta);  // relocs[from..]'s offsets += delta
-void wir_relocs_drop(Vector *relocs, int from);  // relocs[from..] removed
+// to code (their relocations into relocs, at offsets in code; nothing kept
+// is allocated: wasm_ir.c's arena window).  false: not known.
+bool wir_global_addr(Vector *relocs, DataStorage *code, const Name *label);  // i32.const <address or table index>
+bool wir_call(Vector *relocs, DataStorage *code, const Name *label);  // call <function>
+bool wir_call_indirect(Vector *relocs, DataStorage *code, const Type *functype);  // call_indirect <type> <table>
+bool wir_sp(Vector *relocs, DataStorage *code, bool set);  // global.get/set __stack_pointer
+// Relocations through memory that outlives an arena window: their size
+// packed, packed (offsets + delta), and made again into relocs
+size_t wir_relocs_size(Vector *relocs);
+void wir_relocs_save(Vector *relocs, void *dst, uint32_t delta);
+void wir_relocs_restore(const void *src, size_t size, Vector *relocs);
 
 // wasm_opt.c
 void wasm_opt_func(DataStorage *code, Vector *relocs, const unsigned char *ptypes,

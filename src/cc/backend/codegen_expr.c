@@ -8,6 +8,7 @@
 
 #include "ast.h"
 #include "be_aux.h"
+#include "expr.h"  // make_cast, make_expr_num_bop (FPC: wcc's alloca)
 #include "fe_misc.h"  // curscope, extract_bitfield_vale
 #include "ir.h"
 #include "regalloc.h"
@@ -905,6 +906,25 @@ static inline VReg *gen_funcall_sub(Expr *expr, FuncallWork *work) {
 
 static VReg *gen_funcall(Expr *expr) {
   Expr *func = expr->funcall.func;
+#if XCC_TARGET_ARCH == XCC_ARCH_WASM
+  // FPC: wcc (wasm_ir.c): alloca: the shadow stack's pointer down by the
+  // size rounded up to 16, the new pointer the result (IR_SUBSP)
+  if (func->kind == EX_VAR && is_global_scope(func->var.scope) &&
+      func->var.name->bytes == 6 && memcmp(func->var.name->chars, "alloca", 6) == 0 &&
+      expr->funcall.args->len == 1) {
+    Expr *size = expr->funcall.args->data[0];
+    const Token *token = size->token;
+    Expr *aligned_size = make_expr_num_bop(
+        EX_BITAND, token,
+        make_expr_num_bop(EX_ADD, token, make_cast(&tySSize, token, size, false),
+                          new_expr_fixlit(&tySSize, token, 15)),
+        new_expr_fixlit(&tySSize, token, -16));
+    VReg *addend = gen_expr(aligned_size);
+    VReg *result = add_new_vreg(&tyVoidPtr);
+    new_ir_subsp(addend, result);
+    return result;
+  }
+#endif
   if (func->kind == EX_VAR && is_global_scope(func->var.scope)) {
     void *proc = table_get(&builtin_function_table, func->var.name);
     if (proc != NULL)

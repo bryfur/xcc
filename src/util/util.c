@@ -112,6 +112,14 @@ void *realloc_or_die(void *ptr, size_t size) {
   return p;
 }
 
+const Name *alloc_label_uninterned(void) {  // FPC: alloc_name_uninterned
+  static int label_no;
+  ++label_no;
+  char buf[2 + sizeof(int) * 3 + 1];
+  snprintf(buf, sizeof(buf), "b.%04d", label_no);
+  return alloc_name_uninterned(buf, NULL);
+}
+
 const Name *alloc_label(void) {
   static int label_no;
   ++label_no;
