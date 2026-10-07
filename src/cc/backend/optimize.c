@@ -1401,6 +1401,268 @@ static int cmp_int_desc(const void *a, const void *b) {
   return *(const int*)b - *(const int*)a;
 }
 
+// FPC: linear function test replacement.  An innermost loop's test of a
+// counter (iv CMP B at the latch, B constant or not changed in the loop)
+// whose counter is stepped by a constant and read only by its own step
+// and that test, and not after the loop, while a pointer the loop steps
+// in the latch too goes with it (p = p + s, s = k * the counter's step):
+// the test on the pointer instead (p CMP' p + (B - iv) * k, worked out
+// before the loop), and the counter goes (one register fewer in the loop).
+
+static int lftr_succs(BB *bb, BB **out, int max) {
+  int n = 0;
+  IR *last = bb->irs->len > 0 ? bb->irs->data[bb->irs->len - 1] : NULL;
+  if (last != NULL && last->kind == IR_TJMP) {
+    for (size_t k = 0; k < last->tjmp.len && n < max; ++k)
+      out[n++] = last->tjmp.bbs[k];
+    return n;
+  }
+  if (last != NULL && last->kind == IR_JMP && last->jmp.cond != COND_NONE) {
+    out[n++] = last->jmp.bb;
+    if (last->jmp.cond == COND_ANY)
+      return n;
+  }
+  if (bb->next != NULL && n < max)
+    out[n++] = bb->next;
+  return n;
+}
+
+static bool ir_reads_vreg(IR *ir, VReg *v) {
+  if (ir->opr1 == v || ir->opr2 == v)
+    return true;
+  if (ir->additional_operands != NULL) {
+    for (int k = 0; k < ir->additional_operands->len; ++k)
+      if (ir->additional_operands->data[k] == v)
+        return true;
+  }
+  return false;
+}
+
+// Whether v may be read from the start of bb on before it is set
+static bool vreg_live_from(BBContainer *bbcon, BB *start, VReg *v) {
+  int n = bbcon->len;
+  char *seen = calloc_or_die(n + 1);
+  BB **stk = malloc_or_die(sizeof(BB*) * (n + 1));
+  int sp = 0;
+  bool live = false;
+  stk[sp++] = start;
+  int maxs = 2;
+  for (int i = 0; i < n; ++i) {
+    BB *b = bbcon->data[i];
+    IR *last = b->irs->len > 0 ? b->irs->data[b->irs->len - 1] : NULL;
+    if (last != NULL && last->kind == IR_TJMP && (int)last->tjmp.len > maxs)
+      maxs = last->tjmp.len;
+  }
+  BB **succ = malloc_or_die(sizeof(BB*) * (maxs + 1));
+  while (sp > 0 && !live) {
+    BB *bb = stk[--sp];
+    int bi = bb_index(bbcon, bb);
+    if (bi < 0) {
+      live = true;  // (not known: as if)
+      break;
+    }
+    if (seen[bi])
+      continue;
+    seen[bi] = 1;
+    bool set = false;
+    for (int m = 0; m < bb->irs->len; ++m) {
+      IR *ir = bb->irs->data[m];
+      if (ir_reads_vreg(ir, v)) {
+        live = true;
+        break;
+      }
+      if (ir->dst == v) {
+        set = true;
+        break;
+      }
+    }
+    if (live || set)
+      continue;
+    int ns = lftr_succs(bb, succ, maxs);
+    for (int k = 0; k < ns; ++k)
+      stk[sp++] = succ[k];
+    if (sp > n - 1) {  // (bounded: blocks may repeat on the stack)
+      BB **ns2 = realloc_or_die(stk, sizeof(BB*) * (sp + maxs + n + 1));
+      stk = ns2;
+    }
+  }
+  free(succ);
+  free(stk);
+  free(seen);
+  return live;
+}
+
+static void lftr(RegAlloc *ra, BBContainer *bbcon, int h, int j, BB *pre, int *pat) {
+  BB *latch = bbcon->data[j];
+  Vector *lirs = latch->irs;
+  IR *jmp = lirs->data[lirs->len - 1];
+  int cond = jmp->jmp.cond;
+  if (jmp->kind != IR_JMP || jmp->jmp.bb != bbcon->data[h] || cond < COND_EQ || cond > COND_GT)
+    return;
+  VReg *iv = jmp->opr1, *bound = jmp->opr2;
+  if (iv == NULL || bound == NULL || (iv->flag & VRF_CONST)) {
+    return;
+  }
+  if (!plain_int_vreg(iv) || iv->vsize != VRegSize4 || (bound->flag & VRF_FLONUM) ||
+      bound->vsize > VRegSize4)
+    return;
+  // iv: set once in the loop, iv = iv + c in the latch; read only there
+  // and by the test; bound: not set in the loop
+  IR *step = NULL;
+  int istep = -1, nreads = 0;
+  for (int k = h; k <= j; ++k) {
+    Vector *irs = ((BB*)bbcon->data[k])->irs;
+    for (int m = 0; m < irs->len; ++m) {
+      IR *ir = irs->data[m];
+      if (ir->dst == iv) {
+        if (step != NULL || k != j)
+          return;
+        step = ir;
+        istep = m;
+      }
+      if (!(bound->flag & VRF_CONST) && ir->dst == bound)
+        return;
+      if (ir_reads_vreg(ir, iv))
+        nreads += (ir->opr1 == iv) + (ir->opr2 == iv) + (ir->additional_operands != NULL);
+    }
+  }
+  if (step == NULL || (step->kind != IR_ADD && step->kind != IR_SUB) || step->opr1 != iv ||
+      !(step->opr2->flag & VRF_CONST) || (step->opr2->flag & VRF_FLONUM) || nreads != 2)
+    return;
+  int64_t c = step->kind == IR_ADD ? step->opr2->fixnum : -step->opr2->fixnum;
+  if (c == 0)
+    return;
+  // A pointer stepped once in the latch, after the counter... or before:
+  // both stepped by the test
+  IR *pstep = NULL;
+  int64_t k = 0;
+  VReg *kreg = NULL;
+  for (int m = 0; m < lirs->len - 1 && pstep == NULL; ++m) {
+    IR *ir = lirs->data[m];
+    VReg *p = ir->dst;
+    if (ir->kind != IR_ADD || p == NULL || ir->opr1 != p || p == iv || !plain_int_vreg(p) ||
+        p->vsize != VRegSize4 || ir->opr2 == NULL || (ir->opr2->flag & VRF_FLONUM) ||
+        !(p->flag & VRF_UNSIGNED))
+      continue;
+    // set only there in the loop
+    bool once = true;
+    for (int q = h; q <= j && once; ++q) {
+      Vector *irs = ((BB*)bbcon->data[q])->irs;
+      for (int r = 0; r < irs->len; ++r) {
+        IR *x = irs->data[r];
+        if (x != ir && x->dst == p) {
+          once = false;
+          break;
+        }
+        if (!(ir->opr2->flag & VRF_CONST) && x->dst == ir->opr2) {
+          once = false;
+          break;
+        }
+      }
+    }
+    if (!once)
+      continue;
+    // an address the loop accesses memory at (pointer arithmetic: no
+    // wrapping around)
+    bool addr = false;
+    for (int q = h; q <= j && !addr; ++q) {
+      Vector *irs = ((BB*)bbcon->data[q])->irs;
+      for (int r = 0; r < irs->len && !addr; ++r) {
+        IR *x = irs->data[r];
+        addr = (x->kind == IR_LOAD && x->opr1 == p) || (x->kind == IR_STORE && x->opr2 == p);
+      }
+    }
+    if (!addr)
+      continue;
+    if (ir->opr2->flag & VRF_CONST) {
+      int64_t sc = ir->opr2->fixnum;
+      if (sc == 0 || sc % c != 0)
+        continue;
+      k = sc / c;
+    } else {
+      // (a register step: only for == and !=, its sign not known)
+      if ((c != 1 && c != -1) || (cond != COND_EQ && cond != COND_NE))
+        continue;
+      kreg = ir->opr2;
+      k = c;
+    }
+    pstep = ir;
+  }
+  if (pstep == NULL)
+    return;
+  {  // (XCC_LFTR_MAX=n: the first n only, to find a miscompile)
+    static int count, max = -2;
+    if (max == -2) {
+      const char *e = getenv("XCC_LFTR_MAX");
+      max = e != NULL ? atoi(e) : -1;
+    }
+    if (max >= 0 && count >= max)
+      return;
+    ++count;
+    if (getenv("XCC_LFTR_LOG") != NULL)
+      fprintf(stderr, "lftr %d: v%d -> v%d, step %lld, k %lld%s\n", count, iv->virt, pstep->dst->virt,
+              (long long)c, (long long)k, kreg != NULL ? " (reg)" : "");
+  }
+  // The latch's test the only way out (the pointer goes all the way to its
+  // bound: no address made beyond what the loop reaches), and iv not read
+  // after the loop
+  for (int q = h; q <= j; ++q) {
+    BB *b = bbcon->data[q];
+    BB *succ[2];
+    IR *last = b->irs->len > 0 ? b->irs->data[b->irs->len - 1] : NULL;
+    if (last != NULL && last->kind == IR_TJMP)
+      return;
+    int ns = lftr_succs(b, succ, 2);
+    for (int r = 0; r < ns; ++r) {
+      int t = bb_index(bbcon, succ[r]);
+      if (t < h || t > j) {
+        if (q != j || vreg_live_from(bbcon, succ[r], iv))
+          return;
+      }
+    }
+  }
+  UNUSED(istep);
+
+  // Before the loop: pb = p + (bound - iv) * k
+  VReg *p = pstep->dst;
+  int at = *pat;
+  VReg *d = reg_alloc_spawn(ra, VRegSize4, 0);
+  if (bound->flag & VRF_CONST) {
+    VReg *niv = reg_alloc_spawn(ra, VRegSize4, 0);
+    vec_insert(pre->irs, at++, new_ir_bop_raw(IR_NEG, niv, iv, NULL));
+    vec_insert(pre->irs, at++, new_ir_bop_raw(IR_ADD, d, niv,
+                                              reg_alloc_spawn_const(ra, (int32_t)bound->fixnum,
+                                                                    VRegSize4, 0)));
+  } else {
+    vec_insert(pre->irs, at++, new_ir_bop_raw(IR_SUB, d, bound, iv));
+  }
+  VReg *off = reg_alloc_spawn(ra, VRegSize4, 0);
+  VReg *mul = kreg != NULL ? kreg : reg_alloc_spawn_const(ra, (int32_t)k, VRegSize4, 0);
+  vec_insert(pre->irs, at++, new_ir_bop_raw(IR_MUL, off, d, mul));
+  if (kreg != NULL && c == -1) {
+    VReg *noff = reg_alloc_spawn(ra, VRegSize4, 0);
+    vec_insert(pre->irs, at++, new_ir_bop_raw(IR_NEG, noff, off, NULL));
+    off = noff;
+  }
+  VReg *pb = reg_alloc_spawn(ra, VRegSize4, p->flag & VRF_MASK);
+  vec_insert(pre->irs, at++, new_ir_bop_raw(IR_ADD, pb, p, off));
+  *pat = at;
+  // The test on the pointer (an unsigned comparison; reversed for k < 0)
+  if (k < 0 && cond >= COND_LT)
+    cond = swap_cond(cond);
+  jmp->opr1 = p;
+  jmp->opr2 = pb;
+  jmp->jmp.cond = cond;
+  // The counter's step goes (it read only itself then, and nothing after
+  // the loop reads it); what set it before the loop goes as dead
+  int at2 = -1;
+  for (int m = 0; m < lirs->len; ++m)
+    if (lirs->data[m] == step)
+      at2 = m;
+  if (at2 >= 0)
+    vec_remove_at(lirs, at2);
+}
+
 // Returns the number of pointers made
 static int strength_reduce(RegAlloc *ra, BBContainer *bbcon, int h, int j, BB *pre, int *pat,
                            unsigned char *inloop, int *uses, int *defs, int nvregs) {
@@ -1779,6 +2041,25 @@ static void hoist_loop_invariants(RegAlloc *ra, BBContainer *bbcon) {
         hoisted[i] = false;
       }
       vreg_count = n;
+    }
+    // The counter's test on a pointer
+    if (cc_flags.loop_sr && getenv("XCC_NO_LFTR") == NULL) {
+      int nv0 = ra->vregs->len;
+      lftr(ra, bbcon, h, j, pre, &at);
+      if (ra->vregs->len > nv0) {
+        int n = ra->vregs->len;
+        uses = realloc_or_die(uses, sizeof(*uses) * n);
+        defs = realloc_or_die(defs, sizeof(*defs) * n);
+        inloop = realloc_or_die(inloop, n);
+        hoisted = realloc_or_die(hoisted, n);
+        for (int i = vreg_count; i < n; ++i) {
+          uses[i] = 2;
+          defs[i] = 2;
+          inloop[i] = false;
+          hoisted[i] = false;
+        }
+        vreg_count = n;
+      }
     }
 
     // A load in a loop that writes no memory, from an address it doesn't
