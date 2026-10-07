@@ -94,6 +94,7 @@ typedef struct {
   int nvirt;
   int *local;      // [nvirt] its local (-1: none yet)
   int *uses, *defs;  // [nvirt]
+  int *foldpos;      // [nvirt] a folded temporary's place in its block
   unsigned char *ltype;
   int nlocals, cap_locals;
   int nparams;
@@ -359,6 +360,7 @@ static int fold_ops(WE *we, Vector *irs, int j, int cur) {
       IR *d = irs->data[cur];
       if (d->dst == v && foldable_kind(d)) {
         we->folded[cur] = 1;
+        we->foldpos[v->virt] = cur;
         cur = fold_ops(we, irs, cur, cur - 1);
       }
     }
@@ -366,31 +368,23 @@ static int fold_ops(WE *we, Vector *irs, int j, int cur) {
   return cur;
 }
 
-static IR *def_in(Vector *irs, int j, VReg *v) {
-  for (int k = j; --k >= 0; ) {
-    IR *ir = irs->data[k];
-    if (ir->dst == v)
-      return ir;
-  }
-  return NULL;
-}
-
 static void emit_ir(WE *we, Vector *irs, int j);
 
 // An operand of irs[j]: its folded tree or its value (as want)
+// The place of v's folded definition before irs[j] in this block, or -1
+static int folded_def(WE *we, Vector *irs, int j, VReg *v) {
+  if (v == NULL || !foldable_temp(we, v))
+    return -1;
+  int k = we->foldpos[v->virt];
+  return k >= 0 && k < j && we->folded[k] && ((IR*)irs->data[k])->dst == v ? k : -1;
+}
+
 static void emit_operand(WE *we, Vector *irs, int j, VReg *v, unsigned char want) {
-  if (v != NULL && foldable_temp(we, v)) {
-    for (int k = j; --k >= 0; ) {
-      IR *d = irs->data[k];
-      if (d->dst == v) {
-        if (we->folded[k]) {
-          emit_ir(we, irs, k);
-          convert(we, vreg_wt(v), want == 0 ? vreg_wt(v) : want, (v->flag & VRF_UNSIGNED) != 0);
-          return;
-        }
-        break;
-      }
-    }
+  int k = folded_def(we, irs, j, v);
+  if (k >= 0) {
+    emit_ir(we, irs, k);
+    convert(we, vreg_wt(v), want == 0 ? vreg_wt(v) : want, (v->flag & VRF_UNSIGNED) != 0);
+    return;
   }
   push_vreg(we, v, want);
 }
@@ -398,13 +392,10 @@ static void emit_operand(WE *we, Vector *irs, int j, VReg *v, unsigned char want
 // An address operand: what is constant in it goes to the offset.
 static int64_t emit_address(WE *we, Vector *irs, int j, VReg *v) {
   int64_t ofs = 0;
-  if (v != NULL && foldable_temp(we, v)) {
-    for (int k = j; --k >= 0; ) {
+  int k = folded_def(we, irs, j, v);
+  if (k >= 0) {
+    {
       IR *d = irs->data[k];
-      if (d->dst != v)
-        continue;
-      if (!we->folded[k])
-        break;
       if (d->kind == IR_BOFS) {
         int64_t o = frame_offset(we, d->bofs.frameinfo) + d->bofs.offset;
         if (o >= 0) {
@@ -1296,6 +1287,9 @@ static void count_vregs(WE *we) {
   we->nvirt = ra->vregs->len;
   we->local = malloc_or_die(sizeof(int) * (we->nvirt + 1));
   we->uses = calloc_or_die(sizeof(int) * (we->nvirt + 1));
+  we->foldpos = malloc_or_die(sizeof(int) * (we->nvirt + 1));
+  for (int i = 0; i <= we->nvirt; ++i)
+    we->foldpos[i] = -1;
   we->defs = calloc_or_die(sizeof(int) * (we->nvirt + 1));
   for (int i = 0; i < we->nvirt; ++i)
     we->local[i] = -1;
@@ -1954,7 +1948,16 @@ static bool compile_ir(Function *func, DataStorage *code, Vector *relocs) {
     memcpy(out + head.len, body.buf, body.len);
     wir_relocs_save(we.relocs, out + ncode, head.len);
     memcpy(out + ncode + nrel, we.ltype, nlocals);
+    data_release(&head);
   }
+  data_release(&body);
+  for (int i = 0; i < we.relocs->len; ++i)
+    free(we.relocs->data[i]);
+  free_vector(we.relocs);
+  free(we.rpo); free(we.byrpo); free(we.idom); free(we.header); free(we.merge);
+  free(we.kids); free(we.kid_start); free(we.local); free(we.uses); free(we.defs);
+  free(we.foldpos); free(we.ltype); free(we.ctx); free(we.folded);
+  free_vector(we.frames);
   if (arena_stats)
     fprintf(stderr, "arena %.*s: gen %zu, optimize %zu, emit %zu\n", NAMES(func->ident->ident),
             a1 - a0, a2 - a1, ARENA_USED() - a2);
