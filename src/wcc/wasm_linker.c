@@ -39,6 +39,8 @@ struct File {
   };
 };
 
+static Table *attr_exports;  // FPC: functions defined with export_name
+
 static int resolve_symbols_wasmobj(WasmLinker *linker, WasmObj *wasmobj) {
   int err_count = 0;
   Vector *symtab = wasmobj->linking.symtab;
@@ -68,6 +70,9 @@ static int resolve_symbols_wasmobj(WasmLinker *linker, WasmObj *wasmobj) {
           assert(prev == NULL || prev->flags & WASM_SYM_BINDING_WEAK);
           table_put(&linker->defined, sym->name, sym);
         }
+        if (sym->flags & WASM_SYM_EXPORTED && sym->kind == SIK_SYMTAB_FUNCTION &&
+            attr_exports != NULL)
+          table_put(attr_exports, sym->name, NULL);
         table_delete(&linker->unresolved, sym->name);
       }
     }
@@ -1215,6 +1220,7 @@ static inline void verbose_link_result(WasmLinker *linker) {
 }
 
 bool link_wasm_objs(WasmLinker *linker, Table *exports, uint32_t stack_size) {
+  attr_exports = exports;
   const Name *name;
   for (int it = 0; (it = table_iterate(exports, it, &name, NULL)) != -1; ) {
     table_put(&linker->unresolved, name, NULL);

@@ -601,6 +601,8 @@ static void emit_linking_symtab_function_sub(
     // __attribute((import_name("..."))) is specified:
     flags |= WASM_SYM_EXPLICIT_NAME;
   }
+  if (finfo->flag & FF_EXPORT_NAME && finfo->func != NULL)
+    flags |= WASM_SYM_EXPORTED | WASM_SYM_NO_STRIP;  // FPC: export_name
 
   data_push(linking_section, SIK_SYMTAB_FUNCTION);  // kind
   data_uleb128(linking_section, -1, flags);

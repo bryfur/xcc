@@ -127,6 +127,17 @@ static FuncInfo *register_func_info(const Name *funcname, Function *func, VarInf
         parse_error(PE_NOFATAL, expr != NULL ? expr->token : NULL, "import_name: string expected");
       }
     }
+    // FPC: export_name("NAME"), as clang has it (NAME: the function's own)
+    if (table_try_get(attributes, alloc_cname("export_name"), (void**)&params)) {
+      const Expr *expr = params->len > 0 ? params->data[0] : NULL;
+      if (params->len != 1 || expr->kind != EX_STR || expr->str.kind != STR_CHAR)
+        parse_error(PE_NOFATAL, expr != NULL ? expr->token : NULL, "export_name: string expected");
+      else if (!equal_name(alloc_name(expr->str.buf, expr->str.buf + (expr->str.len - 1), false),
+                           funcname))
+        parse_error(PE_NOFATAL, expr->token, "export_name: only the function's own name");
+      else
+        finfo->flag |= FF_EXPORT_NAME;
+    }
   }
 
   if (func != NULL) {

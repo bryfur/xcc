@@ -34,6 +34,7 @@ extern Vector *functypes;  // <DataStorage*>
 #define FF_INDIRECT        (1 << 1)
 #define FF_STACK_MODIFIED  (1 << 2)
 #define FF_IMPORT_NAME     (1 << 3)
+#define FF_EXPORT_NAME     (1 << 4)  // FPC: __attribute__((export_name))
 
 typedef struct {
   Function *func;

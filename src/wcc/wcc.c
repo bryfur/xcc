@@ -164,6 +164,14 @@ static const char *output_wasm_obj(const char *src, const char *ofn, Options *op
   FILE *ofp;
   const char *outfn = NULL;
   if (out_type >= OutExecutable) {
+#if defined(__NuttX__)
+    // FPC: no /tmp on the board: the object is a memory file (xcc_nuttx.c)
+    static int tmp_no;
+    char template[32];
+    snprintf(template, sizeof(template), "/tmp/xcc-%d.o", ++tmp_no);
+    ofp = xcc_memfile(template);
+    char *tmpfn = strdup(template);
+#else
     char template[] = "/tmp/xcc-XXXXXX.o";
     int obj_fd = mkstemps(template, 2);
     if (obj_fd == -1) {
@@ -172,6 +180,7 @@ static const char *output_wasm_obj(const char *src, const char *ofn, Options *op
     }
     char *tmpfn = strdup(template);
     ofp = fdopen(obj_fd, "wb");
+#endif
     outfn = tmpfn;
     vec_push(&remove_on_exit, tmpfn);
   } else {
@@ -696,6 +705,11 @@ static int do_compile(Options *opts) {
 int main(int argc, char *argv[]) {
 #if defined(__wasm)
   const char *root = "/usr";
+#elif defined(__NuttX__)
+  // FPC: the headers and libraries are on the SD card
+  const char *root = getenv("XCC_ROOT");
+  if (root == NULL)
+    root = CONFIG_DEVTOOLS_XCC_ROOT;
 #else
   const char *root = dirname(strdup(argv[0]));
   if (!is_fullpath(root)) {
@@ -710,6 +724,8 @@ int main(int argc, char *argv[]) {
     "__ILP32__",
     "__wasm",
     "__wasm32",
+    "__wasm__",  // FPC: as clang has them
+    "__wasm32__",
     "__STDC__",
     "__STDC_VERSION__=199901L",
     "__SIZEOF_POINTER__=4",

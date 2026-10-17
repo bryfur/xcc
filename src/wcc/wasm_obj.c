@@ -640,7 +640,7 @@ WasmObj *read_wasm(FILE *fp, const char *filename, size_t filesize) {
   if (fread(&header, sizeof(header), 1, fp) != 1 ||
       memcmp(header.magic, MAGIC, sizeof(header.magic)) != 0 ||
       header.binary_version != WASM_BINARY_VERSION) {
-    return false;
+    return NULL;  // FPC: was false
   }
 
   size_t bufsize = filesize - sizeof(header);
@@ -648,7 +648,7 @@ WasmObj *read_wasm(FILE *fp, const char *filename, size_t filesize) {
   size_t readsize = fread(buffer, 1, bufsize, fp);
   if (readsize != bufsize) {
     fprintf(stderr, "load failed: %s\n", filename);
-    return false;
+    return NULL;  // FPC: was false
   }
 
   WasmObj *wasmobj = calloc_or_die(sizeof(*wasmobj));
