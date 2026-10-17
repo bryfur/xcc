@@ -706,7 +706,7 @@ int main(int argc, char *argv[]) {
 #if defined(__wasm)
   const char *root = "/usr";
 #elif defined(__NuttX__)
-  // FPC: the headers and libraries are on the SD card
+  // FPC: the headers and libraries are the card's system files (/system)
   const char *root = getenv("XCC_ROOT");
   if (root == NULL)
     root = CONFIG_DEVTOOLS_XCC_ROOT;
@@ -777,6 +777,10 @@ int main(int argc, char *argv[]) {
   }
 
   if (!opts.nostdinc) {
+#if defined(__NuttX__)
+    // FPC: the card's layout: wcc's C library headers, then the FPC's
+    add_inc_path(INC_AFTER, JOIN_PATHS(root, "include/wasm32"));
+#endif
     add_inc_path(INC_AFTER, JOIN_PATHS(root, "include"));
   }
 
@@ -788,7 +792,11 @@ int main(int argc, char *argv[]) {
   VERBOSES("\n");
 
   if (opts.out_type >= OutExecutable) {
+#if defined(__NuttX__)
+    vec_push(opts.lib_paths, JOIN_PATHS(root, "lib/wasm32"));  // FPC: the card's layout
+#else
     vec_push(opts.lib_paths, JOIN_PATHS(root, "lib"));
+#endif
   }
 
   atexit(remove_tmp_files);
