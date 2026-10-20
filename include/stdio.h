@@ -46,6 +46,7 @@ extern FILE *stderr;
 
 FILE *fopen(const char *fileName, const char *mode);
 FILE *fdopen(int fd, const char *mode);
+FILE *freopen(const char *fileName, const char *mode, FILE *fp);  // FPC
 int fclose(FILE *fp);
 size_t fwrite(const void *buffer, size_t size, size_t count, FILE *fp);
 size_t fread(void *buffer, size_t size, size_t count, FILE *fp);
