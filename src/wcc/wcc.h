@@ -227,6 +227,12 @@ typedef struct FuncExtra {
   Vector *reloc_code;  // <RelocInfo*>
   int setjmp_count;
   size_t offset;  // from code section top (exclude section size).
+  // FPC: the first goto into a block, or case inside a branch, which only
+  // the IR path's structuring takes (wcc's own code generator needs escape
+  // gotos and cases at the switch's top level): reported if the function
+  // does not go through the IR after all
+  const Token *irregular;
+  const char *irregular_msg;
 } FuncExtra;
 
 Expr *get_sp_var(void);

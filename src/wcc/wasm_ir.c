@@ -1606,23 +1606,41 @@ static bool fix_irreducible(WE *we) {
       targets[i] = bb_at(we, entries[i]);
     curbb = disp;
     new_ir_tjmp(label, targets, ne);
-    // Each entry's edges from outside: label = i, to the dispatch
+    // Each entry's edges: label = i, then the dispatch.  (FPC: the edges
+    // from inside the loop too, each through a block of its own: with only
+    // the outside ones the dispatch stays outside the loop and the entries
+    // keep it as their predecessor from outside; with one block for both,
+    // that block is in the loop and entered from outside.  So: the outside
+    // edges' blocks outside, the inside edges' blocks in the loop, and the
+    // dispatch the loop's one entry)
     BB *first_entry = NULL;
     Vector *added = new_vector();
     for (int i = 0; i < ne; ++i) {
       int e = entries[i];
-      BB *set = new_bb();
-      curbb = set;
-      new_ir_mov(label, new_const_vreg(i, VRegSize4, VRF_UNSIGNED));
-      new_ir_jmp(disp);
-      vec_push(added, set);
+      BB *set_out = NULL, *set_in = NULL;
       for (int k = g.pstart[e]; k < g.pstart[e + 1]; ++k) {
         int u = g.pred[k];
-        if (!members[u])
-          redirect(we, u, e, set);
+        BB **setp = members[u] ? &set_in : &set_out;
+        if (*setp == NULL) {
+          *setp = new_bb();
+          curbb = *setp;
+          new_ir_mov(label, new_const_vreg(i, VRegSize4, VRF_UNSIGNED));
+          new_ir_jmp(disp);
+          vec_push(added, *setp);
+        }
+        redirect(we, u, e, *setp);
       }
-      if (e == 0)
-        first_entry = set;
+      if (e == 0) {
+        // (the function's start: its way in, set as from outside)
+        if (set_out == NULL) {
+          set_out = new_bb();
+          curbb = set_out;
+          new_ir_mov(label, new_const_vreg(i, VRegSize4, VRF_UNSIGNED));
+          new_ir_jmp(disp);
+          vec_push(added, set_out);
+        }
+        first_entry = set_out;
+      }
     }
     curbb = NULL;
     curra = NULL;

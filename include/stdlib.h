@@ -50,7 +50,7 @@ int mkstemps(char *tmpl, int suffixlen);
 
 char *getenv(const char *varname);
 
+void abort(void);  // FPC: (WebAssembly too)
 #if !defined(__wasm)
 int system(const char *command);
-void abort(void);
 #endif

@@ -9,6 +9,7 @@
 #define FF_EOF          (1 << 3)
 #define FF_GROWMEM      (1 << 4)
 #define FF_FIFO         (1 << 5)
+#define FF_ERROR        (1 << 6)  // FPC: ferror()
 #define FF_INITIALIZED  (1 << 15)
 
 typedef ssize_t (*cookie_read_function_t)(void *cookie, char *buf, size_t size);

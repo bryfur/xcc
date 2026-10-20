@@ -23,6 +23,7 @@ extern int *__errno_location(void) /*__THROW __attribute__((__const__))*/;
 #define EBADF            9      /* Bad file number */
 #define ECHILD          10      /* No child processes */
 #define EAGAIN          11      /* Try again */
+#define EWOULDBLOCK     EAGAIN  /* FPC: (POSIX: may be the same) */
 #define ENOMEM          12      /* Out of memory */
 #define EACCES          13      /* Permission denied */
 #define EFAULT          14      /* Bad address */

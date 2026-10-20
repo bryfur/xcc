@@ -559,9 +559,19 @@ static void traverse_switch(Stmt *stmt) {
   }
 }
 
+// FPC: what only the IR path takes, noted (gen_defun reports it if the
+// function goes through wcc's own code generator)
+static void note_irregular(const Token *token, const char *msg) {
+  FuncExtra *extra = curfunc->extra;
+  if (extra->irregular == NULL) {
+    extra->irregular = token;
+    extra->irregular_msg = msg;
+  }
+}
+
 static void traverse_case(Stmt *stmt) {
   if (branching_stmt->kind != ST_SWITCH)
-    parse_error(PE_NOFATAL, stmt->token, "case/default inside branch not supported");
+    note_irregular(stmt->token, "case/default inside branch not supported");
   traverse_stmt(stmt->case_.stmt);
 }
 
@@ -647,7 +657,7 @@ static void traverse_goto(Stmt *stmt) {
 
   Stmt *block = is_ancestor(label->parent, stmt);
   if (block == NULL || !is_just_after(label, block)) {
-    parse_error(PE_NOFATAL, stmt->token, "only escape goto supported");
+    note_irregular(stmt->token, "only escape goto supported");
   }
 }
 

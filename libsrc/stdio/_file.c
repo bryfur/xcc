@@ -53,8 +53,13 @@ ssize_t _fread(void *cookie, char *buf, size_t total) {
   if (total < fp->rcapa * 3 / 4) {
     // Read more than requested size and store them to the buffer.
     ssize_t len = read(fp->fd, fp->rbuf, fp->rcapa);
+    if (len < 0) {
+      // FPC: an error, not (size_t)-1 bytes copied out of the buffer
+      fp->flag |= FF_ERROR;
+      len = 0;
+    }
     fp->rs = len;
-    size_t n = len < 0 || (size_t)len < total ? (size_t)len : total;
+    size_t n = (size_t)len < total ? (size_t)len : total;
     fp->rp = n;
     if (n > 0) {
       memcpy(p, fp->rbuf, n);
@@ -67,6 +72,8 @@ ssize_t _fread(void *cookie, char *buf, size_t total) {
   } else {
     // Read to the given buffer directly.
     ssize_t len = read(fp->fd, p, total);
+    if (len < 0)
+      fp->flag |= FF_ERROR;  // FPC
     if (len >= 0) {
       p += len;
       fp->rp = fp->rs = 0;
@@ -104,8 +111,10 @@ int _fflush(FILE *fp) {
     unsigned int wp = fp->wp;
     if (wp > 0) {
       size_t write_size = write(fp->fd, fp->wbuf, wp);
-      if (write_size != (size_t)wp)
+      if (write_size != (size_t)wp) {
+        fp->flag |= FF_ERROR;  // FPC
         return EOF;
+      }
       fp->wp = 0;
     }
   }

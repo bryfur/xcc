@@ -6,11 +6,11 @@
 
 #define EOF  (-1)
 
-enum {
-  SEEK_SET,  // 0
-  SEEK_CUR,  // 1
-  SEEK_END,  // 2
-};
+// FPC: macros (POSIX), not enum constants: code that defines them when
+// they are not macros yet (zlib's zconf.h) broke the enum
+#define SEEK_SET  0
+#define SEEK_CUR  1
+#define SEEK_END  2
 
 typedef struct FILE FILE;
 
@@ -52,7 +52,11 @@ size_t fread(void *buffer, size_t size, size_t count, FILE *fp);
 int fflush(FILE *fp);
 int fseek(FILE *fp, long offset, int origin);
 long ftell(FILE *fp);
+int fseeko(FILE *fp, off_t offset, int origin);  // FPC
+off_t ftello(FILE *fp);
 int feof(FILE *fp);
+int ferror(FILE *fp);  // FPC
+void clearerr(FILE *fp);
 int rename(const char *oldpath, const char *newpath);
 int remove(const char *fn);
 

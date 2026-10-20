@@ -1201,6 +1201,11 @@ static void gen_defun(Function *func) {
     return;
   }
   code->len = 0;
+  if (extra->irregular != NULL) {  // FPC: (see note_irregular())
+    parse_error(PE_NOFATAL, extra->irregular, "%s%s", extra->irregular_msg,
+                eligible ? " (the IR path failed)" : " (the function is not for the IR path)");
+    return;
+  }
 
   uint32_t frame_size = allocate_local_variables(func, code);
 

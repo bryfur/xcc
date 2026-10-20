@@ -323,6 +323,19 @@ static bool asm_bitfield(Inst *inst, ParseInfo *parser, Code *code) {
   return true;
 }
 
+// FPC: saturation: ssat/usat rd, #bits, rn (no shift); minimp3's int16 clip
+static bool asm_saturate(Inst *inst, ParseInfo *parser, Code *code) {
+  Operand *o = inst->opr;
+  if (o[0].type != REG || o[1].type != IMMEDIATE || o[2].type != REG || o[3].type != NOOPERAND)
+    return asm_error(parser, "illegal operand");
+  int64_t bits = o[1].immediate;
+  if (inst->op == SSAT ? (bits < 1 || bits > 32) : (bits < 0 || bits > 31))
+    return asm_error(parser, "illegal saturation");
+  int sat = (int)(inst->op == SSAT ? bits - 1 : bits);
+  put32(code, (inst->op == SSAT ? 0xf300 : 0xf380) | o[2].reg, (o[0].reg << 8) | sat);
+  return true;
+}
+
 // Loads and stores of a core register.
 static bool asm_ldst(Inst *inst, ParseInfo *parser, Code *code) {
   Operand *o = inst->opr;
@@ -737,6 +750,9 @@ void assemble_inst(Inst *inst, ParseInfo *parser, Code *code) {
     break;
   case UBFX: case SBFX:
     ok = asm_bitfield(inst, parser, code);
+    break;
+  case SSAT: case USAT:
+    ok = asm_saturate(inst, parser, code);
     break;
   case LDR: case LDRB: case LDRH: case LDRSB: case LDRSH: case STR: case STRB: case STRH:
     ok = asm_ldst(inst, parser, code);

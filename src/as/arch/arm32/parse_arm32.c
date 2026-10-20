@@ -45,6 +45,7 @@ static const OpName kOpNames[] = {
   {"sdiv", SDIV}, {"udiv", UDIV},
   {"sxtb", SXTB}, {"sxth", SXTH}, {"uxtb", UXTB}, {"uxth", UXTH},
   {"clz", CLZ}, {"rbit", RBIT}, {"ubfx", UBFX}, {"sbfx", SBFX},
+  {"ssat", SSAT}, {"usat", USAT},  // FPC
   {"cbnz", CBNZ}, {"cbz", CBZ},
   {"blx", BLX}, {"bx", BX}, {"bl", BL}, {"b", B},
   {"svc", SVC}, {"nop", NOP},
