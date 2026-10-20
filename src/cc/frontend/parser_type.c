@@ -175,7 +175,10 @@ static StructInfo *parse_struct(bool is_union, Table *attributes) {
         break;
       case TY_STRUCT:
         assert(type->struct_.info != NULL);
-        if (type->struct_.info->flag & SIF_FLEXIBLE) {
+        // FPC: a union may hold a struct with a flexible array member (C11
+        // 6.7.2.1p3 forbids that only in a struct or an array): SQLite's
+        // `union { SrcList sSrc; u8 space[N]; }`
+        if ((type->struct_.info->flag & SIF_FLEXIBLE) && !is_union) {
           assert(tinfo.ident != NULL);
           flex_arr_mem = tinfo.ident;
         }
