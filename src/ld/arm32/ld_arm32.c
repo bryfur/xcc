@@ -33,6 +33,7 @@ enum {
   SHN_UNDEF_ = 0, SHN_ABS_ = 0xfff1, SHN_COMMON_ = 0xfff2,
   R_ARM_NONE_ = 0, R_ARM_ABS32_ = 2, R_ARM_THM_CALL_ = 10, R_ARM_THM_JUMP24_ = 30,
   R_ARM_THM_MOVW_ABS_NC_ = 47, R_ARM_THM_MOVT_ABS_ = 48, R_ARM_V4BX_ = 40,
+  R_ARM_TARGET1_ = 38,  // FPC: ABS32 on this target (gcc's .init_array entries)
 };
 
 // Output sections
@@ -549,7 +550,7 @@ static bool relocate(void) {
         switch (type) {
         case R_ARM_NONE_: case R_ARM_V4BX_:
           break;
-        case R_ARM_ABS32_:
+        case R_ARM_ABS32_: case R_ARM_TARGET1_:
           if (t.os == -2) {
             wr32(p, rd32(p) + t.ofs);
           } else if (t.os >= 0) {
